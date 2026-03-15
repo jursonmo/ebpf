@@ -1,0 +1,79 @@
+提示 undefined: link.AttachTC 是因为 cilium/ebpf 官方库从头到尾都从来没有提供过 link.AttachTC() 这个接口。
+
+如果你在某些教程或 AI 生成的代码脚手架中看到了 link.AttachTC()，那通常是代码生成器的“幻觉”（错误推断），或者是基于某些第三方二次封装库的代码，而不是原生 cilium/ebpf 的 API。
+
+关于 Linux TC（Traffic Control）与 eBPF 的挂载，背景情况是这样的：
+
+1. 为什么没有 link.AttachTC()？
+在 Linux 内核演进中，TC 子系统和 eBPF 一直是两个相对独立的模块。在老版本内核（包括你的 5.15.0）中，将 eBPF 程序挂载到 TC 是通过 Netlink API 来完成的（具体操作是创建 clsact qdisc，然后添加 bpf filter）。
+cilium/ebpf 的维护者认为，由于 TC 树状结构和 Netlink 协议非常复杂，把这些逻辑塞进纯粹的 eBPF 库中显得过于臃肿（参考官方讨论 #769），因此他们有意不提供传统 TC 的挂载接口。
+
+2. 现代内核的 link.AttachTCX() (内核 >= 6.6)
+从 Linux 6.6 开始，内核引入了全新的 TCX (TC eXpress) 机制。TCX 终于支持了标准的 bpf_link 接口。因此，cilium/ebpf 在较新的版本中加入了 link.AttachTCX()。但这套机制在你的 5.15.0 内核上是无法使用的。
+
+在内核 5.15.0 下的正确做法
+针对你的环境（内核 5.15），你需要“组合拳”：
+
+用 cilium/ebpf 解析和加载 eBPF 字节码到内核，获取程序的文件描述符（FD）。
+
+用专门处理网络接口的库（如 github.com/vishvananda/netlink 或 github.com/florianl/go-tc）来将这个 FD 挂载到网卡的 TC 钩子上。
+
+示例代码（使用 vishvananda/netlink）：
+
+Go
+package main
+
+import (
+	"log"
+	"golang.org/x/sys/unix"
+	"github.com/vishvananda/netlink"
+	// 假设你已经用 bpf2go 生成了 objs
+)
+
+func main() {
+	// 1. 使用 cilium/ebpf 加载你的程序
+	objs := bpfObjects{}
+	if err := loadBpfObjects(&objs, nil); err != nil {
+		log.Fatalf("loading objects: %v", err)
+	}
+	defer objs.Close()
+
+	// 2. 使用 netlink 获取网卡
+	ifaceName := "eth0" // 替换为你的网卡名
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		log.Fatalf("failed to get link: %v", err)
+	}
+
+	// 3. 添加 clsact qdisc (必须先有 clsact 才能挂载 ingress/egress)
+	qdisc := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+	// 忽略已存在的错误
+	_ = netlink.QdiscAdd(qdisc)
+
+	// 4. 创建 TC filter 并将 eBPF 程序 FD 注入
+	filter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: link.Attrs().Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS, // 如果是 egress 请用 HANDLE_MIN_EGRESS
+			Handle:    1,
+			Protocol:  unix.ETH_P_ALL,
+		},
+		Fd:           objs.MyTcProgram.FD(), // 这里传入 cilium/ebpf 提取出的 FD
+		Name:         "my_tc_prog",
+		DirectAction: true,
+	}
+
+	if err := netlink.FilterAdd(filter); err != nil {
+		log.Fatalf("failed to attach TC filter: %v", err)
+	}
+	
+	log.Println("TC program successfully attached!")
+}
+总结： 放弃寻找 AttachTC，在 5.15 内核下，老老实实引入 vishvananda/netlink 库来手动配置 clsact 和 filter 才是正解。需要我进一步解释 clsact 挂载点的工作原理吗？
