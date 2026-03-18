@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"time"
 
 	"github.com/cilium/ebpf"
 	//"github.com/cilium/ebpf/link"
 
-	"golang.org/x/sys/unix"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // //go:generate go run github.com/cilium/ebpf/cmd/bpf2go flow bpf/flow.c -- -I./bpf
@@ -43,10 +44,15 @@ func ipToString(ip uint32) string {
 	return net.IP(b).String()
 }
 
-
 func main() {
-
-	ifaceName := "ens2"
+	ifaceName := ""
+	if len(os.Args) > 1 {
+		ifaceName = os.Args[1]
+	}
+	if ifaceName == "" {
+		log.Printf("请指定网卡名，如: %s ens2\n", os.Args[0])
+		return
+	}
 
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
