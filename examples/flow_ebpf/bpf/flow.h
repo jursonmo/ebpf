@@ -1,6 +1,15 @@
 #ifndef __FLOW_H
 #define __FLOW_H
 
+#include <linux/bpf.h>
+//#include <bpf/bpf_helpers.h>
+#include <bpf_helpers.h>
+
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+//#include <netinet/in.h>
 #include <linux/types.h>
 
 struct session_key {
