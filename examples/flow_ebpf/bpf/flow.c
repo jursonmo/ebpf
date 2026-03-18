@@ -55,7 +55,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb,
     if ((void *)(eth + 1) > data_end)
         return -1;
 
-    if (eth->h_proto != __constant_htons(ETH_P_IP))
+    if (eth->h_proto != bpf_htons(ETH_P_IP))
         return -1;
 
     struct iphdr *ip = data + sizeof(*eth);
