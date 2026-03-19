@@ -89,7 +89,7 @@ static __always_inline __u64 match_domain(char *name, int name_len)
         if (j >= name_len)
             break;
         key.name[j] = name[j];
-	asm volatile("");
+	asm volatile("");// 添加这行，阻止 Clang 把它优化成 memcpy, 从而提示error: A call to built-in function 'memcpy' is not supported
     }
 
     val = bpf_map_lookup_elem(&domain_rules, &key);
