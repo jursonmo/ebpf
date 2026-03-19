@@ -25,97 +25,76 @@ struct {
 /* ---- helpers ---- */
 
 /*
- * Parse DNS wire-format query name into a dot-separated lowercase string.
- * Returns the length of the resulting string, or -1 on error.
+ * Parse DNS wire-format name from a pre-read stack buffer (raw)
+ * into a dot-separated lowercase string (buf).
+ * raw must be zero-padded so that bytes beyond actual data are 0.
  */
-static __always_inline int parse_dns_name(struct __sk_buff *skb, __u32 off,
-                                          char *buf)
+static __always_inline int parse_dns_name(char *raw, char *buf)
 {
     int pos = 0;
-    __u8 label_len;
+    int roff = 0;
 
-    //#pragma unroll //关闭所有的unroll,可以让.o文件从38K减少到12K
     for (int i = 0; i < MAX_DNS_LABELS; i++) {
-        if (bpf_skb_load_bytes(skb, off, &label_len, 1) < 0)
+        if (roff >= MAX_DOMAIN_LEN)
             return -1;
-        off++;
+
+        __u8 label_len = (__u8)raw[roff];
+        roff++;
 
         if (label_len == 0)
             break;
-
         if (label_len > 63)
             return -1;
-
+        if (roff + label_len > MAX_DOMAIN_LEN)
+            return -1;
         if (pos + (int)label_len + 1 >= MAX_DOMAIN_LEN)
             return -1;
 
-        if (i > 0)
+        if (i > 0 && pos < MAX_DOMAIN_LEN - 1)
             buf[pos++] = '.';
 
-        //#pragma unroll
-        for (int j = 0; j < 63; j++) {
+        for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
             if (j >= label_len)
                 break;
-            __u8 ch;
-            if (bpf_skb_load_bytes(skb, off + j, &ch, 1) < 0)
-                return -1;
+            int ridx = roff + j;
+            if (ridx >= MAX_DOMAIN_LEN)
+                break;
+            char ch = raw[ridx];
             if (ch >= 'A' && ch <= 'Z')
                 ch += 32;
             if (pos < MAX_DOMAIN_LEN - 1)
                 buf[pos++] = ch;
         }
-        off += label_len;
+        roff += label_len;
     }
 
-    if (pos >= 0 && pos < MAX_DOMAIN_LEN)
+    if (pos < MAX_DOMAIN_LEN)
         buf[pos] = '\0';
     return pos;
 }
 
 /*
- * Look up domain in the rules map, trying progressively shorter suffixes.
- * e.g. "www.google.com" → "google.com" → "com"
+ * Look up domain in the rules map with exact match only.
  * Returns a bitmask of matching rules, or 0 if no match.
  */
 static __always_inline __u64 match_domain(char *name, int name_len)
 {
     struct domain_key key;
     __u64 *val;
-    int off = 0;
+    if (name_len <= 0)
+        return 0;
 
-    //#pragma unroll
-    for (int attempt = 0; attempt < MAX_SUFFIX_DEPTH; attempt++) {
-        if (off >= name_len)
-            return 0;
-
-        __builtin_memset(&key, 0, sizeof(key));
-
-        //#pragma unroll
-        for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
-            int idx = off + j;
-            if (idx >= MAX_DOMAIN_LEN || idx >= name_len)
-                break;
-            key.name[j] = name[idx];
-        }
-
-        val = bpf_map_lookup_elem(&domain_rules, &key);
-        if (val)
-            return *val;
-
-        int found = 0;
-        //#pragma unroll
-        for (int j = off; j < MAX_DOMAIN_LEN; j++) {
-            if (j >= name_len)
-                break;
-            if (name[j] == '.') {
-                off = j + 1;
-                found = 1;
-                break;
-            }
-        }
-        if (!found)
-            return 0;
+    __builtin_memset(&key, 0, sizeof(key));
+    for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
+        if (j >= name_len)
+            break;
+        key.name[j] = name[j];
+	asm volatile("");
     }
+
+    val = bpf_map_lookup_elem(&domain_rules, &key);
+    if (val)
+        return *val;
 
     return 0;
 }
@@ -169,12 +148,25 @@ int dns_mark(struct __sk_buff *skb)
     if (bpf_ntohs(dns.qdcount) < 1)
         return TC_ACT_OK;
 
-    /* --- Parse query domain name --- */
+    /* --- Bulk-read DNS query name into stack buffer --- */
     __u32 name_off = dns_off + sizeof(struct dnshdr);
+    if (skb->len <= name_off)
+        return TC_ACT_OK;
+
+    __u32 avail = skb->len - name_off;
+    if (avail > MAX_DOMAIN_LEN)
+        avail = MAX_DOMAIN_LEN;
+
+    char raw[MAX_DOMAIN_LEN];
+    __builtin_memset(raw, 0, sizeof(raw));
+    if (bpf_skb_load_bytes(skb, name_off, raw, avail) < 0)
+        return TC_ACT_OK;
+
+    /* --- Parse wire-format → dot-separated lowercase --- */
     char domain[MAX_DOMAIN_LEN];
     __builtin_memset(domain, 0, sizeof(domain));
 
-    int name_len = parse_dns_name(skb, name_off, domain);
+    int name_len = parse_dns_name(raw, domain);
     if (name_len <= 0)
         return TC_ACT_OK;
 
