@@ -16,7 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-//go:generate go tool bpf2go -tags linux dnsmark bpf/dns_mark.c -- -I./bpf -I../headers 
+//go:generate go tool bpf2go -tags linux dnsmark bpf/dns_mark.c -- -I./bpf -I../headers
 ////go:generate go tool bpf2go -tags linux dnsmark bpf/dns_mark.c -- -I./bpf -I../headers -DVMLINUX_H
 
 // Rule 每条规则包含多个 CIDR 和多个域名，匹配条件为：源IP命中任一CIDR 且 域名命中任一域名。
@@ -89,15 +89,21 @@ func main() {
 			if filterAdded && filter != nil {
 				if err := netlink.FilterDel(filter); err != nil {
 					log.Printf("删除 TC filter 失败: %v", err)
+				} else {
+					log.Printf("删除 TC filter 成功\n")
 				}
 			}
 			if qdiscAdded && qdisc != nil {
 				if err := netlink.QdiscDel(qdisc); err != nil {
 					log.Printf("删除 clsact qdisc 失败: %v", err)
+				} else {
+					log.Printf("删除 clsact qdisc 成功\n")
 				}
 			}
 			if err := objs.Close(); err != nil {
 				log.Printf("关闭 BPF 对象失败: %v", err)
+			} else {
+				log.Printf("关闭 BPF 对象成功\n")
 			}
 		})
 	}
