@@ -3,7 +3,7 @@
 #include "dns_mark.h"
 #include <bpf_endian.h>
 #include <bpf_helpers.h>
-//char LICENSE[] SEC("license") = "GPL";
+char LICENSE[] SEC("license") = "GPL";
 
 /* ---- maps ---- */
 
@@ -22,83 +22,6 @@ struct {
     __type(value, __u64);
 } cidr_rules SEC(".maps");
 
-/* ---- helpers ---- */
-
-/*
- * Parse DNS wire-format name from a pre-read stack buffer (raw)
- * into a dot-separated lowercase string (buf).
- * raw must be zero-padded so that bytes beyond actual data are 0.
- */
-static __always_inline int parse_dns_name(char *raw, char *buf)
-{
-    int pos = 0;
-    int roff = 0;
-
-    for (int i = 0; i < MAX_DNS_LABELS; i++) {
-        if (roff >= MAX_DOMAIN_LEN)
-            return -1;
-
-        __u8 label_len = (__u8)raw[roff];
-        roff++;
-
-        if (label_len == 0)
-            break;
-        if (label_len > 63)
-            return -1;
-        if (roff + label_len > MAX_DOMAIN_LEN)
-            return -1;
-        if (pos + (int)label_len + 1 >= MAX_DOMAIN_LEN)
-            return -1;
-
-        if (i > 0 && pos < MAX_DOMAIN_LEN - 1)
-            buf[pos++] = '.';
-
-        for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
-            if (j >= label_len)
-                break;
-            int ridx = roff + j;
-            if (ridx >= MAX_DOMAIN_LEN)
-                break;
-            char ch = raw[ridx];
-            if (ch >= 'A' && ch <= 'Z')
-                ch += 32;
-            if (pos < MAX_DOMAIN_LEN - 1)
-                buf[pos++] = ch;
-        }
-        roff += label_len;
-    }
-
-    if (pos < MAX_DOMAIN_LEN)
-        buf[pos] = '\0';
-    return pos;
-}
-
-/*
- * Look up domain in the rules map with exact match only.
- * Returns a bitmask of matching rules, or 0 if no match.
- */
-static __always_inline __u64 match_domain(char *name, int name_len)
-{
-    struct domain_key key;
-    __u64 *val;
-    if (name_len <= 0)
-        return 0;
-
-    __builtin_memset(&key, 0, sizeof(key));
-    for (int j = 0; j < MAX_DOMAIN_LEN - 1; j++) {
-        if (j >= name_len)
-            break;
-        key.name[j] = name[j];
-	asm volatile("");// 添加这行，阻止 Clang 把它优化成 memcpy, 从而提示error: A call to built-in function 'memcpy' is not supported
-    }
-
-    val = bpf_map_lookup_elem(&domain_rules, &key);
-    if (val)
-        return *val;
-
-    return 0;
-}
-
 /* ---- main program ---- */
 
 SEC("tc")
@@ -107,6 +30,7 @@ int dns_mark(struct __sk_buff *skb)
     void *data     = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
+    //bpf_printk("dns_mark: skb->data = %p, skb->data_end = %p\n", skb->data, skb->data_end);
     /* --- ETH --- */
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
@@ -120,6 +44,7 @@ int dns_mark(struct __sk_buff *skb)
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
+    bpf_printk("dns_mark: ip->protocol = %d\n", ip->protocol);
     if (ip->protocol != IPPROTO_UDP)
         return TC_ACT_OK;
 
@@ -135,48 +60,98 @@ int dns_mark(struct __sk_buff *skb)
     if (udp->dest != bpf_htons(DNS_PORT))
         return TC_ACT_OK;
 
-    /* --- DNS header (use skb helper for non-linear data safety) --- */
+    bpf_printk("dns_mark: udp->dest = %d\n", bpf_ntohs(udp->dest));
+    /* --- DNS header (read via helper for non-linear skb safety) --- */
     __u32 dns_off = sizeof(struct ethhdr) + ip_hlen + sizeof(struct udphdr);
 
     struct dnshdr dns;
-    if (bpf_skb_load_bytes(skb, dns_off, &dns, sizeof(dns)) < 0)
+    if (bpf_skb_load_bytes(skb, dns_off, &dns, sizeof(dns)) < 0){
+        bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
         return TC_ACT_OK;
-
-    if (bpf_ntohs(dns.flags) & 0x8000)
+    }
+    bpf_printk("dns_mark: dns.flags = %d\n", bpf_ntohs(dns.flags));
+    if (bpf_ntohs(dns.flags) & 0x8000){
+        bpf_printk("dns_mark: dns.flags = %d not a query, skip\n", bpf_ntohs(dns.flags));
         return TC_ACT_OK;
+    }
 
     if (bpf_ntohs(dns.qdcount) < 1)
+    {
+        bpf_printk("dns_mark: dns.qdcount = %d < 1, skip\n", bpf_ntohs(dns.qdcount));
         return TC_ACT_OK;
+    }
 
-    /* --- Bulk-read DNS query name into stack buffer --- */
+    /* --- Read and parse DNS QNAME into normalized dot-lowercase key --- */
     __u32 name_off = dns_off + sizeof(struct dnshdr);
     if (skb->len <= name_off)
         return TC_ACT_OK;
 
-    __u32 avail = skb->len - name_off;
-    if (avail > MAX_DOMAIN_LEN)
-        avail = MAX_DOMAIN_LEN;
-
-    char raw[MAX_DOMAIN_LEN];
-    __builtin_memset(raw, 0, sizeof(raw));
-    if (bpf_skb_load_bytes(skb, name_off, raw, avail) < 0)
+    __u32 skb_len = skb->len;
+    if (skb_len < name_off)
+        return TC_ACT_OK;
+    if (skb_len - name_off < MAX_DOMAIN_LEN)
         return TC_ACT_OK;
 
-    /* --- Parse wire-format → dot-separated lowercase --- */
-    char domain[MAX_DOMAIN_LEN];
-    __builtin_memset(domain, 0, sizeof(domain));
+    __u8 raw[MAX_DOMAIN_LEN];
+    __builtin_memset(raw, 0, sizeof(raw));
+    if (bpf_skb_load_bytes(skb, name_off, raw, MAX_DOMAIN_LEN) < 0)
+        return TC_ACT_OK;
 
-    int name_len = parse_dns_name(raw, domain);
-    if (name_len <= 0)
+    struct domain_key dkey;
+    __builtin_memset(&dkey, 0, sizeof(dkey));
+
+    __u32 out_pos = 0;
+    __u8 label_rem = 0;
+    __u8 ended = 0;
+    __u8 seen_label = 0;
+
+    for (int i = 0; i < MAX_DOMAIN_LEN; i++) {
+        __u8 b = raw[i];
+
+        if (label_rem == 0) {
+            if (b == 0) {
+                ended = 1;
+                break;
+            }
+
+            /* Reject DNS compression pointers and invalid label length. */
+            if (b & 0xC0)
+                return TC_ACT_OK;
+            if (b > 63)
+                return TC_ACT_OK;
+
+            if (seen_label) {
+                if (out_pos >= MAX_DOMAIN_LEN - 1)
+                    return TC_ACT_OK;
+                dkey.name[out_pos++] = '.';
+            }
+            label_rem = b;
+            seen_label = 1;
+            continue;
+        }
+
+        if (out_pos >= MAX_DOMAIN_LEN - 1)
+            return TC_ACT_OK;
+        if (b >= 'A' && b <= 'Z')
+            b += ('a' - 'A');
+        dkey.name[out_pos++] = b;
+        label_rem--;
+    }
+
+    if (!ended || !seen_label || label_rem != 0 || out_pos == 0)
         return TC_ACT_OK;
 
     /* --- Match domain → rule bitmask --- */
-    __u64 domain_mask = match_domain(domain, name_len);
+    __u64 domain_mask = 0;
+    __u64 *dmask = bpf_map_lookup_elem(&domain_rules, &dkey);
+    if (dmask)
+        domain_mask = *dmask;
     if (domain_mask == 0)
         return TC_ACT_OK;
 
     /* --- Match source IP via LPM trie → rule bitmask --- */
     struct lpm_key lpm;
+    __builtin_memset(&lpm, 0, sizeof(lpm));
     lpm.prefixlen = 32;
     __builtin_memcpy(lpm.ip, &ip->saddr, 4);
 
