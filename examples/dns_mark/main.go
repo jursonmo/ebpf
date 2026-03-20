@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -74,7 +75,33 @@ func main() {
 	if err := loadDnsmarkObjects(&objs, nil); err != nil {
 		log.Fatalf("加载 BPF 对象失败: %v", err)
 	}
-	defer objs.Close()
+
+	var (
+		filter      *netlink.BpfFilter
+		qdisc       *netlink.GenericQdisc
+		filterAdded bool
+		qdiscAdded  bool
+		cleanupOnce sync.Once
+	)
+	cleanup := func(reason string) {
+		cleanupOnce.Do(func() {
+			fmt.Printf("正在卸载... (%s)\n", reason)
+			if filterAdded && filter != nil {
+				if err := netlink.FilterDel(filter); err != nil {
+					log.Printf("删除 TC filter 失败: %v", err)
+				}
+			}
+			if qdiscAdded && qdisc != nil {
+				if err := netlink.QdiscDel(qdisc); err != nil {
+					log.Printf("删除 clsact qdisc 失败: %v", err)
+				}
+			}
+			if err := objs.Close(); err != nil {
+				log.Printf("关闭 BPF 对象失败: %v", err)
+			}
+		})
+	}
+	defer cleanup("程序退出")
 
 	// 2. 填充 domain_rules map
 	domainBitmasks := make(map[string]uint64)
@@ -148,7 +175,7 @@ func main() {
 		log.Fatalf("找不到网卡 %s: %v", cfg.Interface, err)
 	}
 
-	qdisc := &netlink.GenericQdisc{
+	qdisc = &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
 			LinkIndex: lnk.Attrs().Index,
 			Handle:    netlink.MakeHandle(0xffff, 0),
@@ -156,9 +183,16 @@ func main() {
 		},
 		QdiscType: "clsact",
 	}
-	_ = netlink.QdiscAdd(qdisc)
+	if err := netlink.QdiscAdd(qdisc); err != nil {
+		// 兼容接口上已存在 clsact 的场景
+		if !strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			log.Fatalf("创建 clsact qdisc 失败: %v", err)
+		}
+	} else {
+		qdiscAdded = true
+	}
 
-	filter := &netlink.BpfFilter{
+	filter = &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: lnk.Attrs().Index,
 			Parent:    netlink.HANDLE_MIN_INGRESS,
@@ -172,7 +206,7 @@ func main() {
 	if err := netlink.FilterAdd(filter); err != nil {
 		log.Fatalf("挂载 TC filter 失败: %v", err)
 	}
-	defer netlink.FilterDel(filter)
+	filterAdded = true
 
 	// 5. 打印摘要
 	fmt.Printf("dns_mark 已挂载到 %s (ingress)\n", cfg.Interface)
@@ -185,7 +219,6 @@ func main() {
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-
-	fmt.Println("正在卸载...")
+	s := <-sig
+	cleanup(fmt.Sprintf("收到信号 %s", s))
 }
