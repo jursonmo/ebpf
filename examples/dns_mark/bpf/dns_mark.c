@@ -92,16 +92,27 @@ int dns_mark(struct __sk_buff *skb)
         return TC_ACT_OK;
     
     u32 domain_len = skb_len - name_off;
-    domain_len &= 0xFFFF;
+    //domain_len &= 0xFFFF;
     if (domain_len > MAX_DOMAIN_LEN)
         return TC_ACT_OK;
+   // if (domain_len > MAX_DOMAIN_LEN) 
+    //    domain_len = MAX_DOMAIN_LEN;
 
     __u8 raw[MAX_DOMAIN_LEN];
     __builtin_memset(raw, 0, sizeof(raw));
-    if (bpf_skb_load_bytes(skb, name_off, raw, domain_len) < 0){
+    if (domain_len == 0)
+        return TC_ACT_OK;
+
+    //asm volatile ("" : "+r"(domain_len));
+    //if (domain_len == 0) domain_len = 1;
+    u32 final_len = (domain_len - 1) & (MAX_DOMAIN_LEN - 1);
+    final_len += 1;
+    if (bpf_skb_load_bytes(skb, name_off, raw, /*MAX_DOMAIN_LEN*/ final_len) < 0){
         bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
         return TC_ACT_OK;
     }
+
+
     bpf_printk("dns_mark: raw = %s\n", raw);
     struct domain_key dkey;
     __builtin_memset(&dkey, 0, sizeof(dkey));
