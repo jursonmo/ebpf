@@ -183,6 +183,13 @@ func main() {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].key.PrefixLen < entries[j].key.PrefixLen
 	})
+
+	//mo:因为正常的按照最长匹配的方式，长前缀匹配到后就跳出, 得到的mask只有一个bitmask, 如果这样去跟domin的mask对比，可能是匹配不对，但是可以匹配短前缀的网段的。
+	//192.168.0.0/16-->baidu.com
+	//192.168.1.0/24-->qq.com
+	// src 192.168.1.100, dns query baidu.com, 业务上是应该匹配到的，如果单纯按最长匹配，找到第二条规则，第二条规则要求是qq.com才算匹配
+	//这样就匹配不到了，所以需要把短前缀的bitmask传播到被包含的长前缀。第一条规则ipnet 包含了第二条规则ipnet
+	// 所以第二条规则的mask 就是1<<1 | 1<<2 = 3, 然后更新到cidr_rules map中。
 	for i := range entries {
 		for j := 0; j < i; j++ {
 			if entries[j].ipNet.Contains(entries[i].ipNet.IP) {
