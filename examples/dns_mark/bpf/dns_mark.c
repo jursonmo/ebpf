@@ -44,7 +44,6 @@ int dns_mark(struct __sk_buff *skb)
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
-    bpf_printk("dns_mark: ip->protocol = %d\n", ip->protocol);
     if (ip->protocol != IPPROTO_UDP)
         return TC_ACT_OK;
 
@@ -60,6 +59,7 @@ int dns_mark(struct __sk_buff *skb)
     if (udp->dest != bpf_htons(DNS_PORT))
         return TC_ACT_OK;
 
+    //cat /sys/kernel/debug/tracing/trace_pipe
     bpf_printk("dns_mark: udp->dest = %d\n", bpf_ntohs(udp->dest));
     /* --- DNS header (read via helper for non-linear skb safety) --- */
     __u32 dns_off = sizeof(struct ethhdr) + ip_hlen + sizeof(struct udphdr);
@@ -86,17 +86,23 @@ int dns_mark(struct __sk_buff *skb)
     if (skb->len <= name_off)
         return TC_ACT_OK;
 
+    bpf_printk("dns_mark: skb->len = %d, name_off = %d\n", skb->len, name_off);
     __u32 skb_len = skb->len;
     if (skb_len < name_off)
         return TC_ACT_OK;
-    if (skb_len - name_off < MAX_DOMAIN_LEN)
+    
+    u32 domain_len = skb_len - name_off;
+    domain_len &= 0xFFFF;
+    if (domain_len > MAX_DOMAIN_LEN)
         return TC_ACT_OK;
 
     __u8 raw[MAX_DOMAIN_LEN];
     __builtin_memset(raw, 0, sizeof(raw));
-    if (bpf_skb_load_bytes(skb, name_off, raw, MAX_DOMAIN_LEN) < 0)
+    if (bpf_skb_load_bytes(skb, name_off, raw, domain_len) < 0){
+        bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
         return TC_ACT_OK;
-
+    }
+    bpf_printk("dns_mark: raw = %s\n", raw);
     struct domain_key dkey;
     __builtin_memset(&dkey, 0, sizeof(dkey));
 
@@ -138,6 +144,7 @@ int dns_mark(struct __sk_buff *skb)
         label_rem--;
     }
 
+    bpf_printk("get domain key: %s\n", dkey.name);
     if (!ended || !seen_label || label_rem != 0 || out_pos == 0)
         return TC_ACT_OK;
 
@@ -149,6 +156,7 @@ int dns_mark(struct __sk_buff *skb)
     if (domain_mask == 0)
         return TC_ACT_OK;
 
+    bpf_printk("get domain mask: %d\n", domain_mask);
     /* --- Match source IP via LPM trie → rule bitmask --- */
     struct lpm_key lpm;
     __builtin_memset(&lpm, 0, sizeof(lpm));
@@ -157,7 +165,11 @@ int dns_mark(struct __sk_buff *skb)
 
     __u64 *cidr_mask = bpf_map_lookup_elem(&cidr_rules, &lpm);
     if (!cidr_mask)
+    {
+        bpf_printk("get cidr mask failed\n");
         return TC_ACT_OK;
+    }
+    bpf_printk("get cidr mask: %d\n", *cidr_mask);
 
     /* --- Both matched the same rule? Mark it. --- */
     if (domain_mask & *cidr_mask)
