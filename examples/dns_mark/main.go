@@ -75,7 +75,29 @@ func main() {
 	if err := loadDnsmarkObjects(&objs, nil); err != nil {
 		log.Fatalf("加载 BPF 对象失败: %v", err)
 	}
+	/*
+		root@ubuntu:/home/mjw# bpftool map list
+		   154: array  name .rodata  flags 0x480
+		   	key 4B  value 171B  max_entries 1  memlock 4096B
+		   	btf_id 321  frozen
+		   155: hash  name domain_rules  flags 0x0
+		   	key 64B  value 8B  max_entries 4096  memlock 294912B
+		   	btf_id 322
+		   156: lpm_trie  name cidr_rules  flags 0x1
+		   	key 8B  value 8B  max_entries 1024  memlock 16384B
+		   	btf_id 323
 
+			//注意名称 domain_rules 和 cidr_rules, 跟bpf/dns_mark.c中的定义一致
+
+		root@ubuntu:/home/mjw# bpftool prog list
+			1194: sched_cls  name dns_mark  tag 1173f0d154792953  gpl
+					loaded_at 2026-03-20T11:25:02+0000  uid 0
+					xlated 1896B  jited 1218B  memlock 4096B  map_ids 160,161,162
+					btf_id 331
+
+		//注意 dns_mark 名称, 跟bpf/dns_mark.c中的定义一致,  并且可以看到关联的map_ids 160,161,162
+
+	*/
 	var (
 		filter      *netlink.BpfFilter
 		qdisc       *netlink.GenericQdisc
@@ -189,6 +211,7 @@ func main() {
 		},
 		QdiscType: "clsact",
 	}
+
 	if err := netlink.QdiscAdd(qdisc); err != nil {
 		// 兼容接口上已存在 clsact 的场景
 		if !strings.Contains(strings.ToLower(err.Error()), "file exists") {
@@ -213,7 +236,44 @@ func main() {
 		log.Fatalf("挂载 TC filter 失败: %v", err)
 	}
 	filterAdded = true
+	//tc qdisc show dev ens2 clsact 查看 clsact qdisc 是否创建成功
+	// tc qdisc del dev ens2 clsact 删除 clsact qdisc 这个能删除tc filter ingress以及的prog 和map
+	//tc filter show dev ens2 ingress 查看 ingress filter 是否创建成功
+	//tc filter del dev ens2 ingress 删除 ingress filter,  这个能删除对应的prog 和map
+	/*
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# tc qdisc show dev ens2 clsact
+			qdisc clsact ffff: parent ffff:fff1
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# tc filter show dev ens2 ingress
+			filter protocol all pref 49152 bpf chain 0
+			filter protocol all pref 49152 bpf chain 0 handle 0x1 dns_mark direct-action not_in_hw id 1208 tag b3454a0d871e8b3a jited
 
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# bpftool prog show | grep -B 5 "map_ids.*173"
+					1143: cgroup_skb  tag 6deef7357e7b4530  gpl
+					   	loaded_at 2026-03-18T06:03:37+0000  uid 0
+					   	xlated 64B  jited 58B  memlock 4096B
+					1201: sched_cls  name dns_mark  tag b3454a0d871e8b3a  gpl
+					   	loaded_at 2026-03-21T15:40:11+0000  uid 0
+					   	xlated 1952B  jited 1249B  memlock 4096B  map_ids 172,173,174
+				//注意 map_ids 172,173,174, 是被该prog引用的。
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# bpftool map list
+				172: array  name .rodata  flags 0x480
+					key 4B  value 332B  max_entries 1  memlock 4096B
+					btf_id 342  frozen
+				173: hash  name domain_rules  flags 0x0
+					key 64B  value 8B  max_entries 4096  memlock 294912B
+					btf_id 343
+				174: lpm_trie  name cidr_rules  flags 0x1
+					key 8B  value 8B  max_entries 1024  memlock 16384B
+					btf_id 344
+
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark#
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# tc filter del dev ens2 ingress
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark#
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# bpftool prog show | grep -B 5 "map_ids.*173"
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark#
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# bpftool map list
+		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark#
+	*/
 	// 5. 打印摘要
 	fmt.Printf("dns_mark 已挂载到 %s (ingress)\n", cfg.Interface)
 	fmt.Printf("共 %d 条规则, %d 个域名, %d 个 CIDR\n",
