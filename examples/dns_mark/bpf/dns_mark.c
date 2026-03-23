@@ -105,6 +105,10 @@ int dns_mark(struct __sk_buff *skb)
 
     //asm volatile ("" : "+r"(domain_len));
     //if (domain_len == 0) domain_len = 1;
+    // 4. 【核心黑科技】强制告诉验证器：domain_len 的范围是 [1, 64]
+    // 即使我们知道它是对的，也要通过位运算再次锁定
+    // 如果 MAX_DOMAIN_LEN 是 64，我们利用 (domain_len - 1) 进行位掩码
+    // 这样即便 domain_len 是 0，运算后也会变成 63，而不会是 0
     u32 final_len = (domain_len - 1) & (MAX_DOMAIN_LEN - 1);
     final_len += 1;
     if (bpf_skb_load_bytes(skb, name_off, raw, /*MAX_DOMAIN_LEN*/ final_len) < 0){
