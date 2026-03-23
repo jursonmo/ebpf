@@ -23,6 +23,10 @@ struct {
 } cidr_rules SEC(".maps");
 
 /* ---- main program ---- */
+//把下面的函数 dns_mark() 放到 ELF 的 tc section 里，让加载器把它识别成 TC（sched_cls）类型的 eBPF 程序。
+//也不该改成别的程序类型（比如 "xdp"），因为你的函数签名是 struct __sk_buff *，返回值也用的是 TC_ACT_*，和 XDP 上下文不匹配
+// 改成"aaa", 加载 BPF 对象失败: field DnsMark: cannot load program dns_mark: program type is unspecified
+// "tc_mjw" 居然加载 BPF 对象成功， 难道是tc前缀就行?。
 
 SEC("tc")
 int dns_mark(struct __sk_buff *skb)
@@ -117,7 +121,7 @@ int dns_mark(struct __sk_buff *skb)
     }
 
 
-    bpf_printk("dns_mark: raw = %s\n", raw);
+    bpf_printk("dns_mark: get raw domain  = %s\n", raw);
     struct domain_key dkey;
     __builtin_memset(&dkey, 0, sizeof(dkey));
 
