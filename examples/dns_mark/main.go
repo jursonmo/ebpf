@@ -53,6 +53,32 @@ type cidrEntry struct {
 
 const reloadAddr = "127.0.0.1:18080"
 
+func deleteIngressBpfFilters(link netlink.Link, wantName string, wantHandle uint32) (int, error) {
+	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted := 0
+	for _, f := range filters {
+		bpf, ok := f.(*netlink.BpfFilter)
+		if !ok {
+			continue
+		}
+		attrs := bpf.Attrs()
+		matchName := wantName != "" && bpf.Name == wantName
+		matchHandle := wantHandle != 0 && attrs.Handle == wantHandle
+		if !matchName && !matchHandle {
+			continue
+		}
+		if err := netlink.FilterDel(f); err != nil && !errors.Is(err, unix.ENOENT) {
+			return deleted, err
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
 func loadConfig(cfgPath string) (Config, error) {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -238,6 +264,7 @@ func main() {
 	var (
 		filter      *netlink.BpfFilter
 		qdisc       *netlink.GenericQdisc
+		lnk         netlink.Link
 		server      *http.Server
 		filterAdded bool
 		qdiscAdded  bool
@@ -258,7 +285,21 @@ func main() {
 			}
 			if filterAdded && filter != nil {
 				if err := netlink.FilterDel(filter); err != nil {
-					log.Printf("删除 TC filter 失败: %v", err)
+					//莫：每次都失败，打印删除 TC filter 失败: no such file or directory, 所以增加下面这个兜底删除操作。
+					// Some kernels/drivers don't find the object with the original
+					// create attrs on delete; fall back to listing ingress filters.
+					if errors.Is(err, unix.ENOENT) && lnk != nil {
+						n, listErr := deleteIngressBpfFilters(lnk, filter.Name, filter.Attrs().Handle)
+						if listErr != nil {
+							log.Printf("删除 TC filter 失败(兜底删除也失败): %v (fallback: %v)", err, listErr)
+						} else if n > 0 {
+							log.Printf("删除 TC filter 成功(通过兜底扫描删除 %d 条)\n", n)
+						} else {
+							log.Printf("删除 TC filter: 未找到匹配项，可能已被提前删除")
+						}
+					} else {
+						log.Printf("删除 TC filter 失败: %v", err)
+					}
 				} else {
 					log.Printf("删除 TC filter 成功\n")
 				}
@@ -286,7 +327,7 @@ func main() {
 	}
 
 	// 4. 挂载到 TC ingress
-	lnk, err := netlink.LinkByName(cfg.Interface)
+	lnk, err = netlink.LinkByName(cfg.Interface)
 	if err != nil {
 		log.Fatalf("找不到网卡 %s: %v", cfg.Interface, err)
 	}
