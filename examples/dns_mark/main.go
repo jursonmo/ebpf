@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -47,91 +51,77 @@ type cidrEntry struct {
 	bitmask uint64
 }
 
-func main() {
-	cfgPath := "config.json"
-	if len(os.Args) > 1 {
-		cfgPath = os.Args[1]
-	}
+const reloadAddr = "127.0.0.1:18080"
 
+func loadConfig(cfgPath string) (Config, error) {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
-		log.Fatalf("读取配置文件失败: %v", err)
+		return Config{}, fmt.Errorf("读取配置文件失败: %w", err)
 	}
 
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("解析配置文件失败: %v", err)
+		return Config{}, fmt.Errorf("解析配置文件失败: %w", err)
 	}
-
 	if len(cfg.Rules) == 0 {
-		log.Fatal("至少需要一条规则")
+		return Config{}, errors.New("至少需要一条规则")
 	}
 	if len(cfg.Rules) > 64 {
-		log.Fatal("最多支持 64 条规则（bitmask 限制）")
+		return Config{}, errors.New("最多支持 64 条规则（bitmask 限制）")
 	}
+	return cfg, nil
+}
 
-	// 1. 加载 BPF 程序
-	var objs dnsmarkObjects
-	if err := loadDnsmarkObjects(&objs, nil); err != nil {
-		log.Fatalf("加载 BPF 对象失败: %v", err)
-	}
-	/*
-		root@ubuntu:/home/mjw# bpftool map list
-		   154: array  name .rodata  flags 0x480
-		   	key 4B  value 171B  max_entries 1  memlock 4096B
-		   	btf_id 321  frozen
-		   155: hash  name domain_rules  flags 0x0
-		   	key 64B  value 8B  max_entries 4096  memlock 294912B
-		   	btf_id 322
-		   156: lpm_trie  name cidr_rules  flags 0x1
-		   	key 8B  value 8B  max_entries 1024  memlock 16384B
-		   	btf_id 323
-
-			//注意名称 domain_rules 和 cidr_rules, 跟bpf/dns_mark.c中的定义一致
-
-		root@ubuntu:/home/mjw# bpftool prog list
-			1194: sched_cls  name dns_mark  tag 1173f0d154792953  gpl
-					loaded_at 2026-03-20T11:25:02+0000  uid 0
-					xlated 1896B  jited 1218B  memlock 4096B  map_ids 160,161,162
-					btf_id 331
-
-		//注意 dns_mark 名称, 跟bpf/dns_mark.c中的定义一致,  并且可以看到关联的map_ids 160,161,162
-
-	*/
+func clearDomainRulesMap(objs *dnsmarkObjects) error {
 	var (
-		filter      *netlink.BpfFilter
-		qdisc       *netlink.GenericQdisc
-		filterAdded bool
-		qdiscAdded  bool
-		cleanupOnce sync.Once
+		key  dnsmarkDomainKey
+		val  uint64
+		keys []dnsmarkDomainKey
 	)
-	cleanup := func(reason string) {
-		cleanupOnce.Do(func() {
-			fmt.Printf("正在卸载... (%s)\n", reason)
-			if filterAdded && filter != nil {
-				if err := netlink.FilterDel(filter); err != nil {
-					log.Printf("删除 TC filter 失败: %v", err)
-				} else {
-					log.Printf("删除 TC filter 成功\n")
-				}
-			}
-			if qdiscAdded && qdisc != nil {
-				if err := netlink.QdiscDel(qdisc); err != nil {
-					log.Printf("删除 clsact qdisc 失败: %v", err)
-				} else {
-					log.Printf("删除 clsact qdisc 成功\n")
-				}
-			}
-			if err := objs.Close(); err != nil {
-				log.Printf("关闭 BPF 对象失败: %v", err)
-			} else {
-				log.Printf("关闭 BPF 对象成功\n")
-			}
-		})
+	iter := objs.DomainRules.Iterate()
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
 	}
-	defer cleanup("程序退出")
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("遍历 domain_rules 失败: %w", err)
+	}
+	for _, k := range keys {
+		if err := objs.DomainRules.Delete(k); err != nil {
+			return fmt.Errorf("删除 domain_rules 旧规则失败: %w", err)
+		}
+	}
+	return nil
+}
 
-	// 2. 填充 domain_rules map
+func clearCidrRulesMap(objs *dnsmarkObjects) error {
+	var (
+		key  dnsmarkLpmKey
+		val  uint64
+		keys []dnsmarkLpmKey
+	)
+	iter := objs.CidrRules.Iterate()
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("遍历 cidr_rules 失败: %w", err)
+	}
+	for _, k := range keys {
+		if err := objs.CidrRules.Delete(k); err != nil {
+			return fmt.Errorf("删除 cidr_rules 旧规则失败: %w", err)
+		}
+	}
+	return nil
+}
+
+func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrEntry, error) {
+	if err := clearDomainRulesMap(objs); err != nil {
+		return nil, nil, err
+	}
+	if err := clearCidrRulesMap(objs); err != nil {
+		return nil, nil, err
+	}
+
 	domainBitmasks := make(map[string]uint64)
 	for i, rule := range cfg.Rules {
 		mask := uint64(1) << uint(i)
@@ -143,22 +133,21 @@ func main() {
 		var key domainKey
 		copy(key.Name[:], domain)
 		if err := objs.DomainRules.Update(key, mask, 0); err != nil {
-			log.Fatalf("写入域名规则 %q 失败: %v", domain, err)
+			return nil, nil, fmt.Errorf("写入域名规则 %q 失败: %w", domain, err)
 		}
 	}
 
-	// 3. 收集 CIDR 条目，处理前缀重叠
 	cidrMap := make(map[string]*cidrEntry)
 	for i, rule := range cfg.Rules {
 		mask := uint64(1) << uint(i)
 		for _, cidr := range rule.CIDRs {
 			_, ipnet, err := net.ParseCIDR(cidr)
 			if err != nil {
-				log.Fatalf("解析 CIDR %s 失败: %v", cidr, err)
+				return nil, nil, fmt.Errorf("解析 CIDR %s 失败: %w", cidr, err)
 			}
 			ip4 := ipnet.IP.To4()
 			if ip4 == nil {
-				log.Fatalf("仅支持 IPv4: %s", cidr)
+				return nil, nil, fmt.Errorf("仅支持 IPv4: %s", cidr)
 			}
 			prefixLen, _ := ipnet.Mask.Size()
 			cidrStr := ipnet.String()
@@ -200,8 +189,100 @@ func main() {
 
 	for _, e := range entries {
 		if err := objs.CidrRules.Update(e.key, e.bitmask, 0); err != nil {
-			log.Fatalf("写入 CIDR 规则 %s 失败: %v", e.ipNet, err)
+			return nil, nil, fmt.Errorf("写入 CIDR 规则 %s 失败: %w", e.ipNet, err)
 		}
+	}
+
+	return domainBitmasks, entries, nil
+}
+
+func main() {
+	cfgPath := "config.json"
+	if len(os.Args) > 1 {
+		cfgPath = os.Args[1]
+	}
+
+	cfg, err := loadConfig(cfgPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 1. 加载 BPF 程序
+	var objs dnsmarkObjects
+	if err := loadDnsmarkObjects(&objs, nil); err != nil {
+		log.Fatalf("加载 BPF 对象失败: %v", err)
+	}
+	/*
+		root@ubuntu:/home/mjw# bpftool map list
+		   154: array  name .rodata  flags 0x480
+		   	key 4B  value 171B  max_entries 1  memlock 4096B
+		   	btf_id 321  frozen
+		   155: hash  name domain_rules  flags 0x0
+		   	key 64B  value 8B  max_entries 4096  memlock 294912B
+		   	btf_id 322
+		   156: lpm_trie  name cidr_rules  flags 0x1
+		   	key 8B  value 8B  max_entries 1024  memlock 16384B
+		   	btf_id 323
+
+			//注意名称 domain_rules 和 cidr_rules, 跟bpf/dns_mark.c中的定义一致
+
+		root@ubuntu:/home/mjw# bpftool prog list
+			1194: sched_cls  name dns_mark  tag 1173f0d154792953  gpl
+					loaded_at 2026-03-20T11:25:02+0000  uid 0
+					xlated 1896B  jited 1218B  memlock 4096B  map_ids 160,161,162
+					btf_id 331
+
+		//注意 dns_mark 名称, 跟bpf/dns_mark.c中的定义一致,  并且可以看到关联的map_ids 160,161,162
+
+	*/
+	var (
+		filter      *netlink.BpfFilter
+		qdisc       *netlink.GenericQdisc
+		server      *http.Server
+		filterAdded bool
+		qdiscAdded  bool
+		reloadMu    sync.Mutex
+		cleanupOnce sync.Once
+	)
+	cleanup := func(reason string) {
+		cleanupOnce.Do(func() {
+			fmt.Printf("正在卸载... (%s)\n", reason)
+			if server != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				if err := server.Shutdown(ctx); err != nil {
+					log.Printf("关闭 reload HTTP 服务失败: %v", err)
+				} else {
+					log.Printf("关闭 reload HTTP 服务成功\n")
+				}
+				cancel()
+			}
+			if filterAdded && filter != nil {
+				if err := netlink.FilterDel(filter); err != nil {
+					log.Printf("删除 TC filter 失败: %v", err)
+				} else {
+					log.Printf("删除 TC filter 成功\n")
+				}
+			}
+			if qdiscAdded && qdisc != nil {
+				if err := netlink.QdiscDel(qdisc); err != nil {
+					log.Printf("删除 clsact qdisc 失败: %v", err)
+				} else {
+					log.Printf("删除 clsact qdisc 成功\n")
+				}
+			}
+			if err := objs.Close(); err != nil {
+				log.Printf("关闭 BPF 对象失败: %v", err)
+			} else {
+				log.Printf("关闭 BPF 对象成功\n")
+			}
+		})
+	}
+	defer cleanup("程序退出")
+
+	// 2. 初始化并填充 map
+	domainBitmasks, entries, err := rebuildRules(cfg, &objs)
+	if err != nil {
+		log.Fatalf("初始化规则失败: %v", err)
 	}
 
 	// 4. 挂载到 TC ingress
@@ -224,6 +305,7 @@ func main() {
 		if !strings.Contains(strings.ToLower(err.Error()), "file exists") {
 			log.Fatalf("创建 clsact qdisc 失败: %v", err)
 		}
+		//log.Fatalf("创建 clsact qdisc 失败: %v", err)
 	} else {
 		qdiscAdded = true
 	}
@@ -243,6 +325,62 @@ func main() {
 		log.Fatalf("挂载 TC filter 失败: %v", err)
 	}
 	filterAdded = true
+
+	// 5. 启动 reload HTTP 接口
+	currentIface := cfg.Interface
+	mux := http.NewServeMux()
+	mux.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
+
+		newCfg, err := loadConfig(cfgPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusBadRequest)
+			return
+		}
+		if newCfg.Interface != currentIface {
+			http.Error(
+				w,
+				fmt.Sprintf("reload失败: interface 不允许动态变更，当前=%s 新配置=%s", currentIface, newCfg.Interface),
+				http.StatusBadRequest,
+			)
+			//TODO: 删除旧的tc filter 和qdisc，重新创建新的tc filter 和qdisc，重新挂载bpf程序。
+			return
+		}
+
+		newDomainBitmasks, newEntries, err := rebuildRules(newCfg, &objs)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		cfg = newCfg
+		domainBitmasks = newDomainBitmasks
+		entries = newEntries
+		log.Printf("reload成功: 规则=%d 域名=%d CIDR=%d", len(cfg.Rules), len(domainBitmasks), len(entries))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok":      true,
+			"rules":   len(cfg.Rules),
+			"domains": len(domainBitmasks),
+			"cidrs":   len(entries),
+		})
+	})
+	server = &http.Server{
+		Addr:    reloadAddr,
+		Handler: mux,
+	}
+	go func() {
+		log.Printf("reload接口已启动: curl -X POST http://%s/reload", reloadAddr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("reload HTTP 服务异常退出: %v", err)
+		}
+	}()
 	//tc qdisc show dev ens2 clsact 查看 clsact qdisc 是否创建成功
 	// tc qdisc del dev ens2 clsact 删除 clsact qdisc 这个能删除tc filter ingress以及的prog 和map
 	//tc filter show dev ens2 ingress 查看 ingress filter 是否创建成功
@@ -281,14 +419,14 @@ func main() {
 		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark# bpftool map list
 		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark#
 	*/
-	// 5. 打印摘要
+	// 6. 打印摘要
 	fmt.Printf("dns_mark 已挂载到 %s (ingress)\n", cfg.Interface)
 	fmt.Printf("共 %d 条规则, %d 个域名, %d 个 CIDR\n",
 		len(cfg.Rules), len(domainBitmasks), len(entries))
 	for i, rule := range cfg.Rules {
 		fmt.Printf("  规则 %d: CIDRs=%v  Domains=%v\n", i, rule.CIDRs, rule.Domains)
 	}
-	fmt.Println("匹配的 DNS 请求将被打上 mark 53, 按 Ctrl-C 退出并卸载")
+	fmt.Println("匹配的 DNS 请求将被打上 mark 54, 按 Ctrl-C 退出并卸载")
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
