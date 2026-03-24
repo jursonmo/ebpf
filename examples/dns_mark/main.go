@@ -52,6 +52,8 @@ type cidrEntry struct {
 }
 
 const reloadAddr = "127.0.0.1:18080"
+const tcFilterName = "dns_mark"
+const tcFilterHandle uint32 = 1
 
 func deleteIngressBpfFilters(link netlink.Link, wantName string, wantHandle uint32) (int, error) {
 	filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_INGRESS)
@@ -332,6 +334,12 @@ func main() {
 		log.Fatalf("找不到网卡 %s: %v", cfg.Interface, err)
 	}
 
+	if n, delErr := deleteIngressBpfFilters(lnk, tcFilterName, tcFilterHandle); delErr != nil {
+		log.Printf("启动预清理 ingress filter 失败(忽略继续): %v", delErr)
+	} else if n > 0 {
+		log.Printf("启动预清理: 删除历史 ingress filter %d 条", n)
+	}
+
 	qdisc = &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
 			LinkIndex: lnk.Attrs().Index,
@@ -355,15 +363,29 @@ func main() {
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: lnk.Attrs().Index,
 			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    1,
+			Handle:    tcFilterHandle,
 			Protocol:  unix.ETH_P_ALL,
 		},
 		Fd:           objs.DnsMark.FD(),
-		Name:         "dns_mark",
+		Name:         tcFilterName,
 		DirectAction: true,
 	}
 	if err := netlink.FilterAdd(filter); err != nil {
-		log.Fatalf("挂载 TC filter 失败: %v", err)
+		if errors.Is(err, unix.EEXIST) || strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			n, delErr := deleteIngressBpfFilters(lnk, filter.Name, filter.Attrs().Handle)
+			if delErr != nil {
+				log.Fatalf("挂载 TC filter 失败(已存在，且删除旧filter失败): %v", delErr)
+			}
+			if n == 0 {
+				log.Fatalf("挂载 TC filter 失败: 已存在且未找到可删除的历史 filter")
+			}
+			if err = netlink.FilterAdd(filter); err != nil {
+				log.Fatalf("挂载 TC filter 失败(重试后): %v", err)
+			}
+			log.Printf("挂载前发现同名旧 filter，已删除并重试成功")
+		} else {
+			log.Fatalf("挂载 TC filter 失败: %v", err)
+		}
 	}
 	filterAdded = true
 
