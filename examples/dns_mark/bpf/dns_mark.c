@@ -25,8 +25,17 @@ struct {
 /* ---- main program ---- */
 //把下面的函数 dns_mark() 放到 ELF 的 tc section 里，让加载器把它识别成 TC（sched_cls）类型的 eBPF 程序。
 //也不该改成别的程序类型（比如 "xdp"），因为你的函数签名是 struct __sk_buff *，返回值也用的是 TC_ACT_*，和 XDP 上下文不匹配
-// 改成"aaa", 加载 BPF 对象失败: field DnsMark: cannot load program dns_mark: program type is unspecified
+// 改成"aaa", 加载 BPF 对象失败: field DnsMark: cannot load program dns_mark: program type is unspecified (莫:程序类型不明确)
 // "tc_mjw" 居然加载 BPF 对象成功， 难道是tc前缀就行?。
+//可以改，但要改成该工具链支持的名字（例如某些场景会用 tc/ingress、tc/egress、classifier 等），并且用户态 attach 代码也要对应调整。
+//所以实操上：除非你明确知道加载端怎么匹配 section，不建议随意改 SEC("tc")。
+// ebpf elf_reader.go: func getProgType(sectionName string) (ProgramType, AttachType, uint32, string) 这函数里
+//->matchSectionName 确实包含“tc” 前缀会被认为是tc程序, programType类型sys.BPF_PROG_TYPE_SCHED_CLS。
+// fast_l2fwd 的xdp程序就是用的 SEC("xdp_connect") 也正常。因为它会匹配到"xdp"前缀，所以会识别成xdp程序。
+//  SEC("xdp_connect") int xdp_redirect(struct xdp_md *ctx)
+// {
+//     return bpf_redirect_map(&txport_map, ctx->ingress_ifindex, 0);
+// }
 
 SEC("tc")
 int dns_mark(struct __sk_buff *skb)
@@ -107,14 +116,16 @@ int dns_mark(struct __sk_buff *skb)
     if (domain_len == 0)
         return TC_ACT_OK;
 
+        
     //asm volatile ("" : "+r"(domain_len));
     //if (domain_len == 0) domain_len = 1;
     // 4. 【核心黑科技】强制告诉验证器：domain_len 的范围是 [1, 64]
     // 即使我们知道它是对的，也要通过位运算再次锁定
     // 如果 MAX_DOMAIN_LEN 是 64，我们利用 (domain_len - 1) 进行位掩码
-    // 这样即便 domain_len 是 0，运算后也会变成 63，而不会是 0
+    // 这样即便 domain_len 是 0，运算后也会变成 63，而不会是 0   
     u32 final_len = (domain_len - 1) & (MAX_DOMAIN_LEN - 1);
     final_len += 1;
+    //asm volatile ("" : "+r"(final_len));
     if (bpf_skb_load_bytes(skb, name_off, raw, /*MAX_DOMAIN_LEN*/ final_len) < 0){
         bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
         return TC_ACT_OK;
@@ -192,7 +203,7 @@ int dns_mark(struct __sk_buff *skb)
 
     /* --- Both matched the same rule? Mark it. --- */
     if (domain_mask & *cidr_mask)
-        skb->mark = MARK_VALUE;
+        skb->mark = MARK_NO_REDIRECT;
 
     return TC_ACT_OK;
 }
