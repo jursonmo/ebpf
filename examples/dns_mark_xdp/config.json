@@ -1,0 +1,13 @@
+{
+  "interface": "ens2",
+  "rules": [
+    {
+      "cidrs": ["192.168.4.0/24", "10.0.0.0/8"],
+      "domains": ["google.com", "youtube.com"]
+    },
+    {
+      "cidrs": ["172.16.0.0/12"],
+      "domains": ["internal.corp", "api.internal.corp"]
+    }
+  ]
+}
