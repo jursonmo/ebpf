@@ -24,7 +24,15 @@ import (
 )
 
 //go:generate go tool bpf2go -tags linux bpf xdp.c -- -I../headers
+//在xdp 目录下如果执行go generate 没有生成*.o 文件，则执行go generate main.go 解决问题
+/*
+手动执行 go tool bpf2go -tags linux bpf xdp.c -- -I../headers
+Error: missing package, you should either set the go-package flag or the GOPACKAGE env
+所以需要手动执行 go tool bpf2go -go-package main -tags linux bpf xdp.c -- -I../headers 可以解决
 
+其实没必要用go tool bpf2go 命令生成，直接用bpf2go 命令生成即可。
+go:generate bpf2go -go-package main -tags linux bpf xdp.c -- -I../headers
+*/
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatalf("Please specify a network interface")

@@ -16,9 +16,27 @@ import (
 )
 
 // //go:generate go run github.com/cilium/ebpf/cmd/bpf2go flow bpf/flow.c -- -I./bpf
-//go:generate go tool bpf2go  -tags linux flow bpf/flow.c -- -I./bpf -I../headers
-// flow 决定了生成文件的名称，flow_bpfel.go 和 flow_bpfeb.go
+// -tags linux 决定go build的编译条件; "flow" 决定了生成文件的名称，flow_bpfel.go 和 flow_bpfeb.go; 如果不指定 -target参数，则默认生成flow_bpfel.go和flow_bpfeb.go
 
+// //go:generate go tool bpf2go -tags linux -target=amd64 flow bpf/flow.c -- -I./bpf -I../headers
+// //只会生成 flow_x86_bpfel.go  flow_x86_bpfel.o文件，不会生成 flow_bpfel.go 和 flow_bpfeb.go、flow_bpfel.o 和 flow_bpfeb.o文件
+/*  bpf2go -h 命令可以查看帮助信息。
+  -go-package string
+    	package for output go file (default as ENV GOPACKAGE) //莫：说白了，就是生成的.go文件的包名。
+  -tags value
+    	Comma-separated list of Go build tags to include in generated files //莫：说白了，就是生成的.go文件的编译条件。
+  -target string
+    	clang target(s) to compile for (comma separated) (default "bpfel,bpfeb")
+   .....
+   .....
+
+root@ubuntu2204:/home/mjw/ebpf/examples/flow_ebpf# ls
+bpf  flowmon  log  main.go  makefile  vmlinux.h
+root@ubuntu2204:/home/mjw/ebpf/examples/flow_ebpf# go tool bpf2go  -go-package main -tags linux -target=amd64 flow bpf/flow.c -- -I./bpf -I../headers
+root@ubuntu2204:/home/mjw/ebpf/examples/flow_ebpf# ls
+bpf  flowmon  flow_x86_bpfel.go  flow_x86_bpfel.o  log  main.go  makefile  vmlinux.h
+root@ubuntu2204:/home/mjw/ebpf/examples/flow_ebpf#
+*/
 type SessionKey struct {
 	IP1   uint32
 	IP2   uint32
