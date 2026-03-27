@@ -252,7 +252,7 @@ func main() {
 		   	key 8B  value 8B  max_entries 1024  memlock 16384B
 		   	btf_id 323
 
-			//注意名称 domain_rules 和 cidr_rules, 跟bpf/dns_mark.c中的定义一致
+			//注意名称 domain_rules 和 cidr_rules, 跟bpf/dns_mark.c中的定义一致， memlock 是占用内存
 
 		root@ubuntu:/home/mjw# bpftool prog list
 			1194: sched_cls  name dns_mark  tag 1173f0d154792953  gpl
