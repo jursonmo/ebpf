@@ -3,7 +3,7 @@
 
 
 #ifdef VMLINUX_H
-#include "5.15.0.vmlinux.h"
+#include "../../vmlinux_headers/5.15.0.vmlinux.h"
 #define ETH_P_IP 0x0800
 enum tc_action_x {
 	TC_ACT_UNSPEC 		= -1,
