@@ -1,5 +1,7 @@
 TODO: 目前还没解决 加载 BPF 对象失败: field DnsMark: program dns_mark: load program: argument list too long: BPF program is too large. Processed 1000001 insn (38422 line(s) omitted)
 
+莫：解决方法： bpf_loop  5.17 内核
+
 用 eBPF 实现对于某些源 IP 网段的某些指定域名 DNS请求打上 mark 54。
 
 `config.json` 支持通过 `domain_match_mode` 配置域名匹配方式：
