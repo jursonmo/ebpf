@@ -395,7 +395,7 @@ func main() {
 			}
 		})
 	}
-	defer cleanup("程序退出")
+	//defer cleanup("程序退出")
 
 	// 2. 初始化并填充 map
 	domainBitmasks, entries, err := rebuildRules(cfg, &objs)
@@ -577,5 +577,14 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
+	fmt.Println("收到信号 %s", s)
+	err = objs.Close() //关闭bpf对象，但是不会删除 prog map. 还是要调用cleanup函数来删除。
+	if err != nil {
+		log.Printf("关闭 BPF 对象失败: %v\n", err)
+	} else {
+		fmt.Println("关闭 BPF 对象成功")
+	}
+
 	cleanup(fmt.Sprintf("收到信号 %s", s))
+	os.Exit(0)
 }
