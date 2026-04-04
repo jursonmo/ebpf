@@ -40,3 +40,5 @@ BPF_PROG_TYPE_SOCKET_FILTER类型的prog 会关联原始套接字， 原始套�
 行为：数据包已经在协议栈里走完了 TCP/UDP 处理逻辑。在数据被放入该 Socket 的**接收缓冲区（Receive Queue）**之前，内核会运行 eBPF 程序。
 
 结果：如果 eBPF 程序返回 0，内核会直接丢弃这个包。这意味着你的应用程序（调用 read() 或 recv() 的那个进程）永远看不见这个包了。
+
+#### 莫: 对于普通socket, BPF_PROG_TYPE_SOCKET_FILTER类型的prog更多启动过滤drop, 可以读取payload的内容过滤掉，起到应用层防火墙的作用。或者在内核层就过滤掉一些非魔术字的udp 报文。比如我们要实现的功能：一个 UDP 服务端，只接收开头包含魔数 0x474f（大写 "GO"）的数据包，其他的直接在内核态丢弃, 避免外界udp攻击, 影响性能。
