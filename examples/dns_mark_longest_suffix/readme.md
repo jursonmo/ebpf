@@ -1,6 +1,7 @@
 TODO: 目前还没解决 加载 BPF 对象失败: field DnsMark: program dns_mark: load program: argument list too long: BPF program is too large. Processed 1000001 insn (38422 line(s) omitted)
 
 莫：解决方法： bpf_loop  5.17 内核？  尾调用？
+make buildbpfloop 可以编译使用bpf_loop的dns_mark_bpf_loop.c
 
 用 eBPF 实现对于某些源 IP 网段的某些指定域名 DNS请求打上 mark 54。
 

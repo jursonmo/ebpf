@@ -27,6 +27,9 @@ import (
 // 直接用bpf2go 命令生成，不需要go tool bpf2go 命令生成
 // 使用 -fno-builtin-memcpy 可以避免编译时把for循环优化成memcpy指令
 //
+// 内核5.17以上，使用bpf_loop 辅助函数，避免编译后程序体积过大，加载失败。
+// //go:generate bpf2go -tags linux dnsmark bpf/dns_mark_bpf_loop.c -- -I./bpf -I../headers
+//
 //go:generate bpf2go -tags linux dnsmark bpf/dns_mark.c -- -I./bpf -I../headers
 type Rule struct {
 	CIDRs   []string `json:"cidrs"`
