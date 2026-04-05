@@ -25,7 +25,8 @@ import (
 // Rule 每条规则包含多个 CIDR 和多个域名，匹配条件为：源IP命中任一CIDR 且 域名命中任一域名。
 
 // 直接用bpf2go 命令生成，不需要go tool bpf2go 命令生成
-
+// 使用 -fno-builtin-memcpy 可以避免编译时把for循环优化成memcpy指令
+//
 //go:generate bpf2go -tags linux dnsmark bpf/dns_mark.c -- -I./bpf -I../headers
 type Rule struct {
 	CIDRs   []string `json:"cidrs"`

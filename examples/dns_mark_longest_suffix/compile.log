@@ -1,0 +1,9 @@
+
+1. 编译的时候提示error: A call to built-in function 'memcpy' is not supported.
+   原因是只支持常量：
+   ```c
+   #define MAX_SIZE 64
+   __builtin_memcpy(buf, ctx->data, MAX_SIZE); // 编译器会将其展开为指令   
+   ```
+
+   可以用 -fno-builtin-memcpy 避免编译时把for循环优化成memcpy指令

@@ -29,6 +29,50 @@ struct {
     __type(value, __u64);
 } cidr_rules SEC(".maps");
 
+// 使用 __noinline 强制编译器不进行内联，减小主程序校验压力, 
+//但是编译出来的程序体积还是很大，加载还是失败。argument list too long: BPF program is too large. 所以还是要用了bpf_loop或尾调用。
+static __noinline __u64 match_suffix(struct domain_key *dkey, __u32 out_pos, __u8 dot_count, __u8 *dot_positions) {
+    __u64 domain_mask = 0;
+
+    // 限制循环次数，确保 Verifier 能够跟踪
+    //#pragma unroll 0
+    for (int suffix_idx = 0; suffix_idx < MAX_SUFFIX_DEPTH; suffix_idx++) {
+        // 显式边界检查，防止 Verifier 报错
+        if (suffix_idx >= dot_count || suffix_idx >= MAX_SUFFIX_DEPTH)
+            break;
+
+        __u32 start = (__u32)dot_positions[suffix_idx] + 1;
+        if (start >= out_pos)
+            break;
+            
+        __u32 copy_len = out_pos - start;
+        if (copy_len >= MAX_DOMAIN_LEN)
+            copy_len = MAX_DOMAIN_LEN - 1;
+
+        // 在栈上准备搜索用的 key
+        struct domain_key suffix_key;
+        __builtin_memset(&suffix_key, 0, sizeof(suffix_key));
+
+        // 核心复制逻辑：手动循环 + 汇编屏障（防止 LLVM 优化为外部 memcpy）
+        //#pragma unroll 0
+        for (int j = 0; j < MAX_DOMAIN_LEN; j++) {
+            if (j >= copy_len)
+                break;
+            suffix_key.name[j] = dkey->name[start + j];
+            
+            // 关键：防止优化为 memcpy
+            asm volatile("" : : : "memory"); 
+        }
+
+        __u64 *dmask = bpf_map_lookup_elem(&domain_rules, &suffix_key);
+        if (dmask) {
+            domain_mask = *dmask;
+            break; // 找到最长匹配，退出
+        }
+    }
+    return domain_mask;
+}
+
 /* ---- main program ---- */
 SEC("tc")
 int dns_mark(struct __sk_buff *skb)
@@ -210,7 +254,7 @@ int dns_mark(struct __sk_buff *skb)
     if (dmask)
         domain_mask = *dmask;
     if (domain_mask == 0 && domain_match_mode == DOMAIN_MATCH_LONGEST_SUFFIX) {
-#pragma unroll
+/*#pragma unroll
         for (int suffix_idx = 0; suffix_idx < MAX_SUFFIX_DEPTH; suffix_idx++) {
             if (suffix_idx >= dot_count)
                 break;
@@ -235,6 +279,8 @@ int dns_mark(struct __sk_buff *skb)
                 break;
             }
         }
+      */
+        domain_mask = match_suffix(&dkey, out_pos, dot_count, dot_positions);
     }
     if (domain_mask == 0)
         return TC_ACT_OK;
