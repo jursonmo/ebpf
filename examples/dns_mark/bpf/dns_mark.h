@@ -69,7 +69,8 @@ struct __sk_buff {
 #define MAX_DNS_LABELS   8
 #define MAX_SUFFIX_DEPTH 5
 #define DNS_PORT         53
-#define MARK_NO_REDIRECT 54  //为了表明这个mark是绕过dns重定向的mark, 所以marK改成54;iptables -t mangle -I PREROUTING -p udp --dport 53 -m mark --set-mark 54 -j ACCEPT
+#define DEFAULT_MARK_NO_REDIRECT 54  // 默认 mark，可被 mark_config map 覆盖
+#define MARK_CONFIG_KEY 0
 #define IPPROTO_UDP      17
 #define BPF_F_NO_PREALLOC 1
 

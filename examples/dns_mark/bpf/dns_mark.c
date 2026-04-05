@@ -22,6 +22,13 @@ struct {
     __type(value, __u64);
 } cidr_rules SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} mark_config SEC(".maps");
+
 /* ---- main program ---- */
 //把下面的函数 dns_mark() 放到 ELF 的 tc section 里，让加载器把它识别成 TC（sched_cls）类型的 eBPF 程序。
 //也不该改成别的程序类型（比如 "xdp"），因为你的函数签名是 struct __sk_buff *，返回值也用的是 TC_ACT_*，和 XDP 上下文不匹配
@@ -202,8 +209,14 @@ int dns_mark(struct __sk_buff *skb)
     bpf_printk("get cidr mask: %d\n", *cidr_mask);
 
     /* --- Both matched the same rule? Mark it. --- */
-    if (domain_mask & *cidr_mask)
-        skb->mark = MARK_NO_REDIRECT;
+    if (domain_mask & *cidr_mask) {
+        __u32 cfg_key = MARK_CONFIG_KEY;
+        __u32 mark = DEFAULT_MARK_NO_REDIRECT;
+        __u32 *cfg_mark = bpf_map_lookup_elem(&mark_config, &cfg_key);
+        if (cfg_mark)
+            mark = *cfg_mark;
+        skb->mark = mark;
+    }
 
     return TC_ACT_OK;
 }

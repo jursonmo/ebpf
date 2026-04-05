@@ -16,6 +16,7 @@
 ### 配置 `config.json`
 
 - `interface`：挂载 TC ingress 的网卡名（如 `ens2`）。
+- `mark`：命中规则时写入 `skb->mark` 的值；不填或为 `0` 时默认 `54`。
 - `rules`：至少 1 条，最多 **64** 条（bitmask 限制）。每条：
   - `cidrs`：IPv4 CIDR 字符串列表（**仅 IPv4**）。
   - `domains`：域名列表，会转成小写写入 map；与报文里的 **完整 QNAME** 一致时才命中。

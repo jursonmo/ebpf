@@ -31,10 +31,12 @@ type Rule struct {
 
 type Config struct {
 	Interface string `json:"interface"`
+	Mark      uint32 `json:"mark"`
 	Rules     []Rule `json:"rules"`
 }
 
 const maxDomainLen = 64
+const defaultMark uint32 = 54
 
 type domainKey struct {
 	Name [maxDomainLen]byte
@@ -97,7 +99,18 @@ func loadConfig(cfgPath string) (Config, error) {
 	if len(cfg.Rules) > 64 {
 		return Config{}, errors.New("最多支持 64 条规则（bitmask 限制）")
 	}
+	if cfg.Mark == 0 {
+		cfg.Mark = defaultMark
+	}
 	return cfg, nil
+}
+
+func updateMarkConfigMap(objs *dnsmarkObjects, mark uint32) error {
+	key := uint32(0)
+	if err := objs.MarkConfig.Update(key, mark, 0); err != nil {
+		return fmt.Errorf("写入 mark_config 失败: %w", err)
+	}
+	return nil
 }
 
 func clearDomainRulesMap(objs *dnsmarkObjects) error {
@@ -327,6 +340,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化规则失败: %v", err)
 	}
+	if err := updateMarkConfigMap(&objs, cfg.Mark); err != nil {
+		log.Fatalf("初始化 mark 配置失败: %v", err)
+	}
 
 	// 4. 挂载到 TC ingress
 	lnk, err = netlink.LinkByName(cfg.Interface)
@@ -421,14 +437,19 @@ func main() {
 			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
 			return
 		}
+		if err := updateMarkConfigMap(&objs, newCfg.Mark); err != nil {
+			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
+			return
+		}
 
 		cfg = newCfg
 		domainBitmasks = newDomainBitmasks
 		entries = newEntries
-		log.Printf("reload成功: 规则=%d 域名=%d CIDR=%d", len(cfg.Rules), len(domainBitmasks), len(entries))
+		log.Printf("reload成功: mark=%d 规则=%d 域名=%d CIDR=%d", cfg.Mark, len(cfg.Rules), len(domainBitmasks), len(entries))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":      true,
+			"mark":    cfg.Mark,
 			"rules":   len(cfg.Rules),
 			"domains": len(domainBitmasks),
 			"cidrs":   len(entries),
@@ -489,7 +510,7 @@ func main() {
 	for i, rule := range cfg.Rules {
 		fmt.Printf("  规则 %d: CIDRs=%v  Domains=%v\n", i, rule.CIDRs, rule.Domains)
 	}
-	fmt.Println("匹配的 DNS 请求将被打上 mark 54, 按 Ctrl-C 退出并卸载")
+	fmt.Printf("匹配的 DNS 请求将被打上 mark %d, 按 Ctrl-C 退出并卸载\n", cfg.Mark)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
