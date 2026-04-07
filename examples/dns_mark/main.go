@@ -254,6 +254,21 @@ func main() {
 		log.Fatalf("加载 BPF 对象失败: %v", err)
 	}
 	/*
+		    //如果是自己用clang编译的bpf .o文件，可以这样加载。不需要调用bpf2go工具生成的.go文件里的接口
+
+			objPath := "dnsmark_bpfel.o"
+			spec, err := ebpf.LoadCollectionSpec(objPath)
+			if err != nil {
+				log.Fatalf("load bpf object %q: %v", objPath, err)
+			}
+
+			var objs dnsmarkObjects
+			if err := spec.LoadAndAssign(&objs, nil); err != nil {
+				log.Fatalf("load maps/programs: %v", err)
+			}
+	*/
+
+	/*
 		root@ubuntu:/home/mjw# bpftool map list
 		   154: array  name .rodata  flags 0x480
 		   	key 4B  value 171B  max_entries 1  memlock 4096B
