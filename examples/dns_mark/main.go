@@ -262,7 +262,7 @@ func main() {
 				log.Fatalf("load bpf object %q: %v", objPath, err)
 			}
 
-			var objs dnsmarkObjects
+			var objs dnsmarkObjects //自己定义prog map变量的结构体，需要跟bpf/dns_mark.c中的定义一致。bpf2go工具生成的.go文件里的结构体是已经定义好的。
 			if err := spec.LoadAndAssign(&objs, nil); err != nil {
 				log.Fatalf("load maps/programs: %v", err)
 			}
