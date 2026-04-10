@@ -5,6 +5,8 @@
 #include <bpf_helpers.h>
 char LICENSE[] SEC("license") = "GPL";
 
+// 在 include 之后，代码逻辑之前手动定义
+static long (*bpf_loop)(__u32 nr_loops, void *callback_fn, void *callback_ctx, __u64 flags) = (void *) 181;
 enum domain_match_mode {
     DOMAIN_MATCH_EXACT = 0,
     DOMAIN_MATCH_LONGEST_SUFFIX = 1,
