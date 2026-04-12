@@ -58,6 +58,11 @@ type domainKey struct {
 	Name [maxDomainLen]byte
 }
 
+type domainLpmKey struct {
+	PrefixLen uint32
+	Name      [maxDomainLen]byte
+}
+
 type lpmKey struct {
 	PrefixLen uint32
 	IP        [4]byte
@@ -193,6 +198,27 @@ func clearDomainRulesMap(objs *dnsmarkObjects) error {
 	return nil
 }
 
+func clearDomainSuffixRulesMap(objs *dnsmarkObjects) error {
+	var (
+		key  dnsmarkDomainLpmKey
+		val  uint64
+		keys []dnsmarkDomainLpmKey
+	)
+	iter := objs.DomainSuffixRules.Iterate()
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("遍历 domain_suffix_rules 失败: %w", err)
+	}
+	for _, k := range keys {
+		if err := objs.DomainSuffixRules.Delete(k); err != nil {
+			return fmt.Errorf("删除 domain_suffix_rules 旧规则失败: %w", err)
+		}
+	}
+	return nil
+}
+
 func clearCidrRulesMap(objs *dnsmarkObjects) error {
 	var (
 		key  dnsmarkLpmKey
@@ -214,8 +240,19 @@ func clearCidrRulesMap(objs *dnsmarkObjects) error {
 	return nil
 }
 
+func reverseDomain(domain string) string {
+	buf := []byte(domain)
+	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
+		buf[i], buf[j] = buf[j], buf[i]
+	}
+	return string(buf)
+}
+
 func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrEntry, error) {
 	if err := clearDomainRulesMap(objs); err != nil {
+		return nil, nil, err
+	}
+	if err := clearDomainSuffixRulesMap(objs); err != nil {
 		return nil, nil, err
 	}
 	if err := clearCidrRulesMap(objs); err != nil {
@@ -223,10 +260,13 @@ func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrE
 	}
 
 	domainBitmasks := make(map[string]uint64)
+	suffixBitmasks := make(map[string]uint64)
 	for i, rule := range cfg.Rules {
 		mask := uint64(1) << uint(i)
 		for _, d := range rule.Domains {
-			domainBitmasks[strings.ToLower(d)] |= mask
+			normalized := strings.ToLower(d)
+			domainBitmasks[normalized] |= mask
+			suffixBitmasks[reverseDomain(normalized)] |= mask
 		}
 	}
 	for domain, mask := range domainBitmasks {
@@ -234,6 +274,14 @@ func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrE
 		copy(key.Name[:], domain)
 		if err := objs.DomainRules.Update(key, mask, 0); err != nil {
 			return nil, nil, fmt.Errorf("写入域名规则 %q 失败: %w", domain, err)
+		}
+	}
+	for reversedDomain, mask := range suffixBitmasks {
+		var key domainLpmKey
+		key.PrefixLen = uint32(len(reversedDomain) * 8)
+		copy(key.Name[:], reversedDomain)
+		if err := objs.DomainSuffixRules.Update(key, mask, 0); err != nil {
+			return nil, nil, fmt.Errorf("写入域名后缀规则 %q 失败: %w", reversedDomain, err)
 		}
 	}
 

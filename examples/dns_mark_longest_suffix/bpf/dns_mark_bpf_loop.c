@@ -5,8 +5,6 @@
 #include <bpf_helpers.h>
 char LICENSE[] SEC("license") = "GPL";
 
-// 在 include 之后，代码逻辑之前手动定义
-static long (*bpf_loop)(__u32 nr_loops, void *callback_fn, void *callback_ctx, __u64 flags) = (void *) 181;
 enum domain_match_mode {
     DOMAIN_MATCH_EXACT = 0,
     DOMAIN_MATCH_LONGEST_SUFFIX = 1,
@@ -25,92 +23,32 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 4096);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct domain_lpm_key);
+    __type(value, __u64);
+} domain_suffix_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 1024);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, struct lpm_key);
     __type(value, __u64);
 } cidr_rules SEC(".maps");
 
-// 使用 __noinline 强制编译器不进行内联，减小主程序校验压力, 
-//但是编译出来的程序体积还是很大，加载还是失败。argument list too long: BPF program is too large. 所以还是要用了bpf_loop或尾调用。
-static __noinline __u64 match_suffix(struct domain_key *dkey, __u32 out_pos, __u8 dot_count, __u8 *dot_positions) {
-    __u64 domain_mask = 0;
+static __always_inline void build_reversed_lpm_key(struct domain_lpm_key *key,
+                                                   const struct domain_key *dkey,
+                                                   __u32 out_pos)
+{
+    __builtin_memset(key, 0, sizeof(*key));
+    key->prefixlen = out_pos << 3;
 
-    // 限制循环次数，确保 Verifier 能够跟踪
-    //#pragma unroll 0
-    for (int suffix_idx = 0; suffix_idx < MAX_SUFFIX_DEPTH; suffix_idx++) {
-        // 显式边界检查，防止 Verifier 报错
-        if (suffix_idx >= dot_count || suffix_idx >= MAX_SUFFIX_DEPTH)
+    for (int i = 0; i < MAX_DOMAIN_LEN - 1; i++) {
+        if ((__u32)i >= out_pos)
             break;
-
-        __u32 start = (__u32)dot_positions[suffix_idx] + 1;
-        if (start >= out_pos)
-            break;
-            
-        __u32 copy_len = out_pos - start;
-        if (copy_len >= MAX_DOMAIN_LEN)
-            copy_len = MAX_DOMAIN_LEN - 1;
-
-        // 在栈上准备搜索用的 key
-        struct domain_key suffix_key;
-        __builtin_memset(&suffix_key, 0, sizeof(suffix_key));
-
-        // 核心复制逻辑：手动循环 + 汇编屏障（防止 LLVM 优化为外部 memcpy）
-        //#pragma unroll 0
-        for (int j = 0; j < MAX_DOMAIN_LEN; j++) {
-            if (j >= copy_len)
-                break;
-            suffix_key.name[j] = dkey->name[start + j];
-            
-            // 关键：防止优化为 memcpy
-            asm volatile("" : : : "memory"); 
-        }
-
-        __u64 *dmask = bpf_map_lookup_elem(&domain_rules, &suffix_key);
-        if (dmask) {
-            domain_mask = *dmask;
-            break; // 找到最长匹配，退出
-        }
+        key->name[i] = dkey->name[out_pos - 1 - i];
     }
-    return domain_mask;
-}
-
-struct match_ctx {
-    struct domain_key *dkey;
-    __u8 *dot_positions;
-    __u32 out_pos;
-    __u8 dot_count;
-    __u64 mask; // 存储匹配结果
-};
-static long suffix_callback(__u32 index, struct match_ctx *ctx) {
-    // 边界安全检查
-    if (index >= ctx->dot_count || index >= MAX_SUFFIX_DEPTH)
-        return 1; // 停止循环
-
-    __u32 start = (__u32)ctx->dot_positions[index] + 1;
-    if (start >= ctx->out_pos)
-        return 0; // 继续找下一个后缀
-
-    __u32 copy_len = ctx->out_pos - start;
-    if (copy_len >= MAX_DOMAIN_LEN) copy_len = MAX_DOMAIN_LEN - 1;
-
-    struct domain_key suffix_key;
-    __builtin_memset(&suffix_key, 0, sizeof(suffix_key));
-
-    // 内部拷贝依然建议使用防止优化为 memcpy 的技巧
-    for (int j = 0; j < MAX_DOMAIN_LEN; j++) {
-        if (j >= copy_len) break;
-        suffix_key.name[j] = ctx->dkey->name[start + j];
-        asm volatile("" : : : "memory");
-    }
-
-    __u64 *dmask = bpf_map_lookup_elem(&domain_rules, &suffix_key);
-    if (dmask) {
-        ctx->mask = *dmask;
-        return 1; // 找到了，停止循环
-    }
-
-    return 0; // 没找到，继续下一次循环
 }
 
 /* ---- main program ---- */
@@ -217,9 +155,6 @@ int dns_mark(struct __sk_buff *skb)
     __u8 label_rem = 0;
     __u8 ended = 0;
     __u8 seen_label = 0;
-    __u8 dot_positions[MAX_SUFFIX_DEPTH];
-    __u8 dot_count = 0;
-    __builtin_memset(dot_positions, 0, sizeof(dot_positions));
 
     /*
     这段代码的作用是将 DNS Query Name（QNAME）从 wire 格式（如: 3www6google3com0）解码并标准化为小写点分（如: www.google.com）。
@@ -265,8 +200,6 @@ int dns_mark(struct __sk_buff *skb)
             if (seen_label) {
                 if (out_pos >= MAX_DOMAIN_LEN - 1)
                     return TC_ACT_OK;
-                if (dot_count < MAX_SUFFIX_DEPTH)
-                    dot_positions[dot_count++] = out_pos;
                 dkey.name[out_pos++] = '.';
             }
             label_rem = b;
@@ -294,46 +227,12 @@ int dns_mark(struct __sk_buff *skb)
     if (dmask)
         domain_mask = *dmask;
     if (domain_mask == 0 && domain_match_mode == DOMAIN_MATCH_LONGEST_SUFFIX) {
-/*#pragma unroll
-        for (int suffix_idx = 0; suffix_idx < MAX_SUFFIX_DEPTH; suffix_idx++) {
-            if (suffix_idx >= dot_count)
-                break;
+        struct domain_lpm_key suffix_key;
 
-            __u32 start = (__u32)dot_positions[suffix_idx] + 1;
-            if (start >= out_pos)
-                break;
-            __u32 copy_len = out_pos - start;
-
-            struct domain_key suffix_key;
-            __builtin_memset(&suffix_key, 0, sizeof(suffix_key));
-#pragma unroll
-            for (int j = 0; j < MAX_DOMAIN_LEN; j++) {
-                if (j >= copy_len)
-                    break;
-                suffix_key.name[j] = dkey.name[start + j];
-            }
-
-            dmask = bpf_map_lookup_elem(&domain_rules, &suffix_key);
-            if (dmask) {
-                domain_mask = *dmask;
-                break;
-            }
-        }
-      */
-       // domain_mask = match_suffix(&dkey, out_pos, dot_count, dot_positions);
-
-
-       struct match_ctx mctx = {
-            .dkey = &dkey,
-            .dot_positions = dot_positions,
-            .out_pos = out_pos,
-            .dot_count = dot_count,
-            .mask = 0,
-        };
-
-        // 参数：循环次数，回调函数，上下文指针，标志位
-        bpf_loop(dot_count, suffix_callback, &mctx, 0);
-        domain_mask = mctx.mask;
+        build_reversed_lpm_key(&suffix_key, &dkey, out_pos);
+        dmask = bpf_map_lookup_elem(&domain_suffix_rules, &suffix_key);
+        if (dmask)
+            domain_mask = *dmask;
     }
 
     if (domain_mask == 0)

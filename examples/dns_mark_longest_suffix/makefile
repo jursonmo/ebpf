@@ -5,7 +5,7 @@ build: generate
 	GOOS=linux GOARCH=amd64 go build -o dns_mark .
 
 bpf_loop_generate:
-	bpf2go -tags linux dnsmark bpf/dns_mark_bpf_loop.c -- -I./bpf -I../headers
+	bpf2go -go-package main -tags linux dnsmark bpf/dns_mark_bpf_loop.c -- -I./bpf -I../headers
 
 buildbpfloop: bpf_loop_generate
 	GOOS=linux GOARCH=amd64 go build -o dns_mark_bpf_loop .

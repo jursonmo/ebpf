@@ -9,6 +9,21 @@ CONFIG_DEBUG_INFO_BTF_MODULES=y
 make buildbpfloop 可以编译使用bpf_loop的dns_mark_bpf_loop.c
 在dns_mark_bpf_loop.c 加上bpf_loop的定义，编译出来的.o还是有17K, 依然提示 BPF program is too large
 
+2026.04.12 bpf_loop也不好解决BPF program is too large 和 verifier 检验的问题。
+先修改成dns域名反转最长匹配的方式：
+当前这版“整串反转后做前缀匹配”的实现，a.bb.com 会被 aa.bb.com 误命中。
+因为我现在这版是把整串域名直接反转后放进 LPM trie：
+
+规则 a.bb.com -> moc.bb.a
+报文 aa.bb.com -> moc.bb.aa
+而 moc.bb.a 确实是 moc.bb.aa 的前缀，所以会误匹配。
+
+你这个担心是对的，根因是“字符前缀”不等于“DNS label 边界上的后缀匹配”。我们真正想要的是：
+bb.com 能匹配 aa.bb.com
+a.bb.com 不能匹配 aa.bb.com
+
+
+------------------------------------
 用 eBPF 实现对于某些源 IP 网段的某些指定域名 DNS请求打上 mark 54。
 
 `config.json` 支持通过 `domain_match_mode` 配置域名匹配方式：

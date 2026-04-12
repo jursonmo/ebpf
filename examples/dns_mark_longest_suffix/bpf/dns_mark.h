@@ -78,6 +78,11 @@ struct domain_key {
     char name[MAX_DOMAIN_LEN];
 };
 
+struct domain_lpm_key {
+    __u32 prefixlen;
+    char name[MAX_DOMAIN_LEN];
+};
+
 struct lpm_key {
     __u32 prefixlen;
     __u8  ip[4];
