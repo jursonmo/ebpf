@@ -79,12 +79,12 @@ struct domain_key {
 };
 
 struct domain_lpm_key {
-    __u32 prefixlen;
+    __u32 prefixlen; //前缀长度，单位是 bit, 不是字节
     char name[MAX_DOMAIN_LEN];
 };
 
 struct lpm_key {
-    __u32 prefixlen;
+    __u32 prefixlen; //前缀长度，单位是 bit, 不是字节， 所以ipv4的prefixlen是32, 不是4
     __u8  ip[4];
 };
 

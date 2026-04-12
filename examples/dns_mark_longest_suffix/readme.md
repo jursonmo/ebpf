@@ -22,7 +22,16 @@ make buildbpfloop 可以编译使用bpf_loop的dns_mark_bpf_loop.c
 bb.com 能匹配 aa.bb.com
 a.bb.com 不能匹配 aa.bb.com
 
+解决方法：
+最简单稳妥的办法是把反转 key 做成“带 label 边界终止符”的形式，比如：
 
+规则 a.bb.com -> moc.bb.a.
+报文 aa.bb.com -> moc.bb.aa.
+规则 bb.com -> moc.bb.
+
+这样：
+moc.bb.a. 不是 moc.bb.aa. 的前缀，不会误匹配
+moc.bb. 是 moc.bb.aa. 的前缀，仍然能正确命中后缀规则
 ------------------------------------
 用 eBPF 实现对于某些源 IP 网段的某些指定域名 DNS请求打上 mark 54。
 

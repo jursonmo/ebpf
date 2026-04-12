@@ -240,11 +240,12 @@ func clearCidrRulesMap(objs *dnsmarkObjects) error {
 	return nil
 }
 
-func reverseDomain(domain string) string {
+func reverseDomainForSuffixMatch(domain string) string {
 	buf := []byte(domain)
 	for i, j := 0, len(buf)-1; i < j; i, j = i+1, j-1 {
 		buf[i], buf[j] = buf[j], buf[i]
 	}
+	buf = append(buf, '.')
 	return string(buf)
 }
 
@@ -266,7 +267,7 @@ func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrE
 		for _, d := range rule.Domains {
 			normalized := strings.ToLower(d)
 			domainBitmasks[normalized] |= mask
-			suffixBitmasks[reverseDomain(normalized)] |= mask
+			suffixBitmasks[reverseDomainForSuffixMatch(normalized)] |= mask
 		}
 	}
 	for domain, mask := range domainBitmasks {

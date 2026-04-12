@@ -42,13 +42,14 @@ static __always_inline void build_reversed_lpm_key(struct domain_lpm_key *key,
                                                    __u32 out_pos)
 {
     __builtin_memset(key, 0, sizeof(*key));
-    key->prefixlen = out_pos << 3;
+    key->prefixlen = (out_pos + 1) << 3;
 
     for (int i = 0; i < MAX_DOMAIN_LEN - 1; i++) {
         if ((__u32)i >= out_pos)
             break;
         key->name[i] = dkey->name[out_pos - 1 - i];
     }
+    key->name[out_pos] = '.';
 }
 
 /* ---- main program ---- */
