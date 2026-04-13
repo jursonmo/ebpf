@@ -37,6 +37,27 @@ struct {
     __type(value, __u64);
 } cidr_rules SEC(".maps");
 
+/*
+out_pos 表示 dkey.name 数组中域名字符串的长度（已经写入的字节数），也就是标准点分形式域名的总长度。
+
+在 eBPF LPM trie 进行最长前缀匹配时，需要指定一个“前缀长度”，单位是 bit。LPM trie 的 key（即 struct domain_lpm_key）里，prefixlen 就表示多少 bit 有效。
+
+而我们的 key 是反转加了 label 终止符('.')的字符串，例如：
+- 域名 a.bb.com 处理后是 "moc.bb.a."
+- 长度 out_pos = strlen("moc.bb.a.") = 9（实际 out_pos 等于还没加终止符的长度，函数里会在最后补终止 '.'）
+
+因为每个字符占 1 字节 = 8 bit，我们想让 LPM trie 精确匹配前 N 字节（即 N*8 bit），所以要把 out_pos+1（加上我们补的终止点）乘以 8，得到需要匹配的有效 bit 数。
+即：
+    key->prefixlen = (out_pos + 1) << 3;
+等价于
+    key->prefixlen = (out_pos + 1) * 8;
+这样 LPM trie 就严格把整个 key 都当作前缀参与匹配，不会出现 a.bb.com 误命中 aa.bb.com 的情况。
+
+总结：
+- out_pos 表示字符串（域名转小写点分）已占用的 length（不算 C 字符串结束符）。
+- “<<3” 是乘以 8，单位转换成 bit，供 LPM trie 存储和匹配。
+*/
+
 static __always_inline void build_reversed_lpm_key(struct domain_lpm_key *key,
                                                    const struct domain_key *dkey,
                                                    __u32 out_pos)
