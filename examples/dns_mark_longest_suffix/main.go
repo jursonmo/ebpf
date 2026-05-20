@@ -55,6 +55,7 @@ const (
 type Config struct {
 	Interface       string          `json:"interface"`
 	DomainMatchMode DomainMatchMode `json:"domain_match_mode"`
+	Debug           bool            `json:"debug"`
 	Rules           []Rule          `json:"rules"`
 }
 
@@ -157,6 +158,13 @@ func (m DomainMatchMode) bpfValue() uint32 {
 		return bpfDomainMatchLongestSuffix
 	}
 	return bpfDomainMatchExact
+}
+
+func bpfDebugValue(enabled bool) uint32 {
+	if enabled {
+		return 1
+	}
+	return 0
 }
 
 func normalizeDomain(domain string) (string, error) {
@@ -404,6 +412,13 @@ func main() {
 	if err := spec.Variables["domain_match_mode"].Set(cfg.DomainMatchMode.bpfValue()); err != nil {
 		log.Fatalf("设置 domain_match_mode 失败: %v", err)
 	}
+	debugVariable, ok := spec.Variables["debug_enabled"]
+	if !ok {
+		log.Fatal("BPF 变量 debug_enabled 不存在，请重新生成 BPF 对象")
+	}
+	if err := debugVariable.Set(bpfDebugValue(cfg.Debug)); err != nil {
+		log.Fatalf("设置 debug_enabled 失败: %v", err)
+	}
 	var objs dnsmarkObjects
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("加载 BPF 对象失败: %v", err)
@@ -584,6 +599,10 @@ func main() {
 			//TODO: 删除旧的tc filter 和qdisc，重新创建新的tc filter 和qdisc，重新挂载bpf程序。
 			return
 		}
+		if newCfg.Debug != cfg.Debug {
+			http.Error(w, "reload失败: debug 不支持动态变更，请重启程序后生效", http.StatusBadRequest)
+			return
+		}
 
 		newDomainBitmasks, newEntries, err := rebuildRules(newCfg, &objs)
 		if err != nil {
@@ -606,6 +625,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":                true,
 			"domain_match_mode": cfg.DomainMatchMode,
+			"debug":             cfg.Debug,
 			"rules":             len(cfg.Rules),
 			"domains":           len(domainBitmasks),
 			"cidrs":             len(entries),
@@ -662,6 +682,7 @@ func main() {
 	// 6. 打印摘要
 	fmt.Printf("dns_mark 已挂载到 %s (ingress)\n", cfg.Interface)
 	fmt.Printf("域名匹配模式: %s\n", cfg.DomainMatchMode)
+	fmt.Printf("debug日志: %v\n", cfg.Debug)
 	fmt.Printf("共 %d 条规则, %d 个域名, %d 个 CIDR\n",
 		len(cfg.Rules), len(domainBitmasks), len(entries))
 	for i, rule := range cfg.Rules {

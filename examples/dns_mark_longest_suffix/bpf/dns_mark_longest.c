@@ -11,6 +11,13 @@ enum domain_match_mode {
 };
 
 volatile const __u32 domain_match_mode = DOMAIN_MATCH_EXACT;
+volatile const __u32 debug_enabled = 0;
+
+#define debug_bpf_printk(...)        \
+    do {                             \
+        if (debug_enabled)           \
+            bpf_printk(__VA_ARGS__); \
+    } while (0)
 
 /* ---- maps ---- */
 
@@ -107,24 +114,24 @@ int dns_mark(struct __sk_buff *skb)
         return TC_ACT_OK;
 
     //cat /sys/kernel/debug/tracing/trace_pipe
-    bpf_printk("dns_mark: udp->dest = %d\n", bpf_ntohs(udp->dest));
+    debug_bpf_printk("dns_mark: udp->dest = %d\n", bpf_ntohs(udp->dest));
     /* --- DNS header (read via helper for non-linear skb safety) --- */
     __u32 dns_off = sizeof(struct ethhdr) + ip_hlen + sizeof(struct udphdr);
 
     struct dnshdr dns;
     if (bpf_skb_load_bytes(skb, dns_off, &dns, sizeof(dns)) < 0){
-        bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
+        debug_bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
         return TC_ACT_OK;
     }
-    bpf_printk("dns_mark: dns.flags = %d\n", bpf_ntohs(dns.flags));
+    debug_bpf_printk("dns_mark: dns.flags = %d\n", bpf_ntohs(dns.flags));
     if (bpf_ntohs(dns.flags) & 0x8000){
-        bpf_printk("dns_mark: dns.flags = %d not a query, skip\n", bpf_ntohs(dns.flags));
+        debug_bpf_printk("dns_mark: dns.flags = %d not a query, skip\n", bpf_ntohs(dns.flags));
         return TC_ACT_OK;
     }
 
     if (bpf_ntohs(dns.qdcount) < 1)
     {
-        bpf_printk("dns_mark: dns.qdcount = %d < 1, skip\n", bpf_ntohs(dns.qdcount));
+        debug_bpf_printk("dns_mark: dns.qdcount = %d < 1, skip\n", bpf_ntohs(dns.qdcount));
         return TC_ACT_OK;
     }
 
@@ -133,7 +140,7 @@ int dns_mark(struct __sk_buff *skb)
     if (skb->len <= name_off)
         return TC_ACT_OK;
 
-    bpf_printk("dns_mark: skb->len = %d, name_off = %d\n", skb->len, name_off);
+    debug_bpf_printk("dns_mark: skb->len = %d, name_off = %d\n", skb->len, name_off);
     __u32 skb_len = skb->len;
     if (skb_len < name_off)
         return TC_ACT_OK;
@@ -161,12 +168,12 @@ int dns_mark(struct __sk_buff *skb)
     final_len += 1;
     //asm volatile ("" : "+r"(final_len));
     if (bpf_skb_load_bytes(skb, name_off, raw, /*MAX_DOMAIN_LEN*/ final_len) < 0){
-        bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
+        debug_bpf_printk("dns_mark: bpf_skb_load_bytes failed\n");
         return TC_ACT_OK;
     }
 
 
-    bpf_printk("dns_mark: get raw domain  = %s\n", raw);
+    debug_bpf_printk("dns_mark: get raw domain  = %s\n", raw);
     struct domain_key dkey;
     __builtin_memset(&dkey, 0, sizeof(dkey));
 
@@ -236,7 +243,7 @@ int dns_mark(struct __sk_buff *skb)
         label_rem--;
     }
 
-    bpf_printk("get domain key: %s\n", dkey.name);
+    debug_bpf_printk("get domain key: %s\n", dkey.name);
     if (!ended || !seen_label || label_rem != 0 || out_pos == 0) {
         //bpf_printk("dns_mark: ended=%d seen_label=%d label_rem=%d out_pos=%d invalid domain name\n",ended, seen_label, label_rem, out_pos); 
         return TC_ACT_OK;
@@ -248,26 +255,26 @@ int dns_mark(struct __sk_buff *skb)
     __u64 *dmask = bpf_map_lookup_elem(&domain_rules, &dkey);
     if (dmask)
         domain_mask = *dmask;
-    bpf_printk("domain exact mask=%llu\n", domain_mask);
-    bpf_printk("domain match mode=%u\n", mode);
+    debug_bpf_printk("domain exact mask=%llu\n", domain_mask);
+    debug_bpf_printk("domain match mode=%u\n", mode);
     if (domain_mask == 0 && mode == DOMAIN_MATCH_LONGEST_SUFFIX) {
         struct domain_lpm_key suffix_key;
 
         build_reversed_lpm_key(&suffix_key, &dkey, out_pos);
-        bpf_printk("suffix lookup key prefix=%u name=%s\n", suffix_key.prefixlen, suffix_key.name);
+        debug_bpf_printk("suffix lookup key prefix=%u name=%s\n", suffix_key.prefixlen, suffix_key.name);
         dmask = bpf_map_lookup_elem(&domain_suffix_rules, &suffix_key);
         if (dmask) {
             domain_mask = *dmask;
-            bpf_printk("suffix lookup hit mask=%llu\n", domain_mask);
+            debug_bpf_printk("suffix lookup hit mask=%llu\n", domain_mask);
         } else {
-            bpf_printk("suffix lookup miss\n");
+            debug_bpf_printk("suffix lookup miss\n");
         }
     }
 
     if (domain_mask == 0)
         return TC_ACT_OK;
 
-    bpf_printk("get domain mask: %llu\n", domain_mask);
+    debug_bpf_printk("get domain mask: %llu\n", domain_mask);
     /* --- Match source IP via LPM trie → rule bitmask --- */
     struct lpm_key lpm;
     __builtin_memset(&lpm, 0, sizeof(lpm));
@@ -277,15 +284,15 @@ int dns_mark(struct __sk_buff *skb)
     __u64 *cidr_mask = bpf_map_lookup_elem(&cidr_rules, &lpm);
     if (!cidr_mask)
     {
-        bpf_printk("get cidr mask failed\n");
+        debug_bpf_printk("get cidr mask failed\n");
         return TC_ACT_OK;
     }
-    bpf_printk("get cidr mask: %llu\n", *cidr_mask);
+    debug_bpf_printk("get cidr mask: %llu\n", *cidr_mask);
 
     /* --- Both matched the same rule? Mark it. --- */
     if (domain_mask & *cidr_mask){        
         skb->mark = MARK_NO_REDIRECT;
-        bpf_printk("domain:%s, skb->mark=%d\n", dkey.name, skb->mark);
+        debug_bpf_printk("domain:%s, skb->mark=%d\n", dkey.name, skb->mark);
     }
     return TC_ACT_OK;
 }
