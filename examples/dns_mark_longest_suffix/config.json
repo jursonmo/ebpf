@@ -1,6 +1,6 @@
 {
   "interface": "ens2",
-  "domain_match_mode": "exact",
+  "debug": false,
   "rules": [
     {
       "cidrs": ["192.168.4.0/24", "10.0.0.0/8"],
