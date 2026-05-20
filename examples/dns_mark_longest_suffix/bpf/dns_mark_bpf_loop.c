@@ -46,16 +46,13 @@ out_pos 表示 dkey.name 数组中域名字符串的长度（已经写入的字�
 - 域名 a.bb.com 处理后是 "moc.bb.a."
 - 长度 out_pos = strlen("moc.bb.a.") = 9（实际 out_pos 等于还没加终止符的长度，函数里会在最后补终止 '.'）
 
-因为每个字符占 1 字节 = 8 bit，我们想让 LPM trie 精确匹配前 N 字节（即 N*8 bit），所以要把 out_pos+1（加上我们补的终止点）乘以 8，得到需要匹配的有效 bit 数。
-即：
-    key->prefixlen = (out_pos + 1) << 3;
-等价于
-    key->prefixlen = (out_pos + 1) * 8;
-这样 LPM trie 就严格把整个 key 都当作前缀参与匹配，不会出现 a.bb.com 误命中 aa.bb.com 的情况。
+规则写入 LPM trie 时，prefixlen 使用规则域名长度；查询 LPM trie 时，
+prefixlen 要使用 key 的最大长度。这样内核会用完整查询 key 做 longest
+prefix lookup，返回最长的规则前缀。
 
 总结：
 - out_pos 表示字符串（域名转小写点分）已占用的 length（不算 C 字符串结束符）。
-- “<<3” 是乘以 8，单位转换成 bit，供 LPM trie 存储和匹配。
+- “<<3” 是乘以 8，单位转换成 bit。
 */
 
 static __always_inline void build_reversed_lpm_key(struct domain_lpm_key *key,
@@ -63,7 +60,7 @@ static __always_inline void build_reversed_lpm_key(struct domain_lpm_key *key,
                                                    __u32 out_pos)
 {
     __builtin_memset(key, 0, sizeof(*key));
-    key->prefixlen = (out_pos + 1) << 3;
+    key->prefixlen = MAX_DOMAIN_LEN << 3;
 
     for (int i = 0; i < MAX_DOMAIN_LEN - 1; i++) {
         if ((__u32)i >= out_pos)
@@ -240,27 +237,37 @@ int dns_mark(struct __sk_buff *skb)
     }
 
     bpf_printk("get domain key: %s\n", dkey.name);
-    if (!ended || !seen_label || label_rem != 0 || out_pos == 0)
+    if (!ended || !seen_label || label_rem != 0 || out_pos == 0) {
+        //bpf_printk("dns_mark: ended=%d seen_label=%d label_rem=%d out_pos=%d invalid domain name\n",ended, seen_label, label_rem, out_pos); 
         return TC_ACT_OK;
+    }
 
     /* --- Match domain → rule bitmask --- */
     __u64 domain_mask = 0;
+    __u32 mode = domain_match_mode;
     __u64 *dmask = bpf_map_lookup_elem(&domain_rules, &dkey);
     if (dmask)
         domain_mask = *dmask;
-    if (domain_mask == 0 && domain_match_mode == DOMAIN_MATCH_LONGEST_SUFFIX) {
+    bpf_printk("domain exact mask=%llu\n", domain_mask);
+    bpf_printk("domain match mode=%u\n", mode);
+    if (domain_mask == 0 && mode == DOMAIN_MATCH_LONGEST_SUFFIX) {
         struct domain_lpm_key suffix_key;
 
         build_reversed_lpm_key(&suffix_key, &dkey, out_pos);
+        bpf_printk("suffix lookup key prefix=%u name=%s\n", suffix_key.prefixlen, suffix_key.name);
         dmask = bpf_map_lookup_elem(&domain_suffix_rules, &suffix_key);
-        if (dmask)
+        if (dmask) {
             domain_mask = *dmask;
+            bpf_printk("suffix lookup hit mask=%llu\n", domain_mask);
+        } else {
+            bpf_printk("suffix lookup miss\n");
+        }
     }
 
     if (domain_mask == 0)
         return TC_ACT_OK;
 
-    bpf_printk("get domain mask: %d\n", domain_mask);
+    bpf_printk("get domain mask: %llu\n", domain_mask);
     /* --- Match source IP via LPM trie → rule bitmask --- */
     struct lpm_key lpm;
     __builtin_memset(&lpm, 0, sizeof(lpm));
@@ -273,11 +280,12 @@ int dns_mark(struct __sk_buff *skb)
         bpf_printk("get cidr mask failed\n");
         return TC_ACT_OK;
     }
-    bpf_printk("get cidr mask: %d\n", *cidr_mask);
+    bpf_printk("get cidr mask: %llu\n", *cidr_mask);
 
     /* --- Both matched the same rule? Mark it. --- */
-    if (domain_mask & *cidr_mask)
+    if (domain_mask & *cidr_mask){        
         skb->mark = MARK_NO_REDIRECT;
-
+        bpf_printk("domain:%s, skb->mark=%d\n", dkey.name, skb->mark);
+    }
     return TC_ACT_OK;
 }

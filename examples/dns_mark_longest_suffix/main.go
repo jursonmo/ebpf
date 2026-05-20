@@ -42,8 +42,14 @@ const (
 	DomainMatchModeExact         DomainMatchMode = "exact"
 	DomainMatchModeLongestSuffix DomainMatchMode = "longest_suffix"
 
-	bpfDomainMatchExact uint32 = iota
-	bpfDomainMatchLongestSuffix
+	// bpfDomainMatchExact = iota
+	// bpfDomainMatchLongestSuffix
+	// 上面这段代码有bug，bpfDomainMatchLongestSuffix会变成3, 所以不能这样写
+)
+
+const (
+	bpfDomainMatchExact         uint32 = 0
+	bpfDomainMatchLongestSuffix uint32 = 1
 )
 
 type Config struct {
@@ -144,7 +150,8 @@ func normalizeDomainMatchMode(mode DomainMatchMode) (DomainMatchMode, error) {
 	case DomainMatchModeExact, DomainMatchModeLongestSuffix:
 		return mode, nil
 	default:
-		return "", fmt.Errorf("不支持的 domain_match_mode=%q，可选值: %q, %q", mode, DomainMatchModeExact, DomainMatchModeLongestSuffix)
+		return DomainMatchModeLongestSuffix, nil // 默认使用最长后缀匹配模式.
+		//return "", fmt.Errorf("不支持的 domain_match_mode=%q，可选值: %q, %q", mode, DomainMatchModeExact, DomainMatchModeLongestSuffix)
 	}
 }
 
@@ -249,6 +256,41 @@ func reverseDomainForSuffixMatch(domain string) string {
 	return string(buf)
 }
 
+func domainSuffixLookupKey(domain string) domainLpmKey {
+	reversedDomain := reverseDomainForSuffixMatch(domain)
+	var key domainLpmKey
+	key.PrefixLen = maxDomainLen * 8
+	copy(key.Name[:], reversedDomain)
+	return key
+}
+
+func checkDomainSuffixRules(cfg Config, objs *dnsmarkObjects) {
+	if cfg.DomainMatchMode != DomainMatchModeLongestSuffix {
+		return
+	}
+
+	for _, rule := range cfg.Rules {
+		for _, domain := range rule.Domains {
+			tests := []string{domain}
+			if !strings.HasPrefix(domain, "www.") {
+				tests = append(tests, "www."+domain)
+			}
+
+			for _, testDomain := range tests {
+				key := domainSuffixLookupKey(testDomain)
+				var mask uint64
+				if err := objs.DomainSuffixRules.Lookup(key, &mask); err != nil {
+					log.Printf("domain_suffix_rules 自检失败: query=%q reversed=%q prefixlen=%d err=%v",
+						testDomain, reverseDomainForSuffixMatch(testDomain), key.PrefixLen, err)
+					continue
+				}
+				log.Printf("domain_suffix_rules 自检命中: query=%q reversed=%q prefixlen=%d mask=%d",
+					testDomain, reverseDomainForSuffixMatch(testDomain), key.PrefixLen, mask)
+			}
+		}
+	}
+}
+
 func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrEntry, error) {
 	if err := clearDomainRulesMap(objs); err != nil {
 		return nil, nil, err
@@ -284,6 +326,7 @@ func rebuildRules(cfg Config, objs *dnsmarkObjects) (map[string]uint64, []*cidrE
 		if err := objs.DomainSuffixRules.Update(key, mask, 0); err != nil {
 			return nil, nil, fmt.Errorf("写入域名后缀规则 %q 失败: %w", reversedDomain, err)
 		}
+		log.Printf("写入域名后缀规则: reversed=%q prefixlen=%d mask=%d", reversedDomain, key.PrefixLen, mask)
 	}
 
 	cidrMap := make(map[string]*cidrEntry)
@@ -455,6 +498,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("初始化规则失败: %v", err)
 	}
+	checkDomainSuffixRules(cfg, &objs)
 
 	// 4. 挂载到 TC ingress
 	lnk, err = netlink.LinkByName(cfg.Interface)
@@ -549,6 +593,7 @@ func main() {
 			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
 			return
 		}
+		checkDomainSuffixRules(newCfg, &objs)
 		if newCfg.DomainMatchMode != cfg.DomainMatchMode {
 			if err := setLoadedDomainMatchMode(&objs, newCfg.DomainMatchMode); err != nil {
 				http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
