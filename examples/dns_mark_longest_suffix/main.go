@@ -675,7 +675,7 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
-	fmt.Println("收到信号 %s", s)
+	fmt.Println("收到信号:", s)
 	err = objs.Close() //关闭bpf对象，但是不会删除 prog map. 还是要调用cleanup函数来删除。
 	if err != nil {
 		log.Printf("关闭 BPF 对象失败: %v\n", err)
