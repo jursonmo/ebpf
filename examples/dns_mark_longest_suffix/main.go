@@ -143,9 +143,6 @@ func loadConfig(cfgPath string) (Config, error) {
 }
 
 func normalizeDomainMatchMode(mode DomainMatchMode) (DomainMatchMode, error) {
-	if mode == "" {
-		return DomainMatchModeExact, nil
-	}
 	switch mode {
 	case DomainMatchModeExact, DomainMatchModeLongestSuffix:
 		return mode, nil
