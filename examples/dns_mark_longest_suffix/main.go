@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,6 +58,11 @@ type Config struct {
 	DomainMatchMode DomainMatchMode `json:"domain_match_mode"`
 	Debug           bool            `json:"debug"`
 	Rules           []Rule          `json:"rules"`
+}
+
+type debugRequest struct {
+	Debug   *bool `json:"debug"`
+	Enabled *bool `json:"enabled"`
 }
 
 const maxDomainLen = 64
@@ -187,6 +193,44 @@ func setLoadedDomainMatchMode(objs *dnsmarkObjects, mode DomainMatchMode) error 
 		return fmt.Errorf("写入 BPF 变量 domain_match_mode 失败: %w", err)
 	}
 	return nil
+}
+
+func setLoadedDebugMode(objs *dnsmarkObjects, enabled bool) error {
+	if objs.DebugConfig == nil {
+		return errors.New("BPF map debug_config 不存在")
+	}
+	key := uint32(0)
+	value := bpfDebugValue(enabled)
+	if err := objs.DebugConfig.Update(key, value, 0); err != nil {
+		return fmt.Errorf("写入 BPF debug_config 失败: %w", err)
+	}
+	return nil
+}
+
+func parseDebugEnabled(r *http.Request) (bool, error) {
+	raw := r.URL.Query().Get("debug")
+	if raw == "" {
+		raw = r.URL.Query().Get("enabled")
+	}
+	if raw != "" {
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			return false, fmt.Errorf("debug 参数必须是 true 或 false")
+		}
+		return enabled, nil
+	}
+
+	var req debugRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return false, fmt.Errorf("请求体需要是 JSON，例如 {\"debug\":true}: %w", err)
+	}
+	if req.Debug != nil {
+		return *req.Debug, nil
+	}
+	if req.Enabled != nil {
+		return *req.Enabled, nil
+	}
+	return false, errors.New("请求体缺少 debug 或 enabled 字段")
 }
 
 func clearDomainRulesMap(objs *dnsmarkObjects) error {
@@ -412,16 +456,12 @@ func main() {
 	if err := spec.Variables["domain_match_mode"].Set(cfg.DomainMatchMode.bpfValue()); err != nil {
 		log.Fatalf("设置 domain_match_mode 失败: %v", err)
 	}
-	debugVariable, ok := spec.Variables["debug_enabled"]
-	if !ok {
-		log.Fatal("BPF 变量 debug_enabled 不存在，请重新生成 BPF 对象")
-	}
-	if err := debugVariable.Set(bpfDebugValue(cfg.Debug)); err != nil {
-		log.Fatalf("设置 debug_enabled 失败: %v", err)
-	}
 	var objs dnsmarkObjects
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("加载 BPF 对象失败: %v", err)
+	}
+	if err := setLoadedDebugMode(&objs, cfg.Debug); err != nil {
+		log.Fatalf("设置 debug_config 失败: %v", err)
 	}
 	/*
 		root@ubuntu:/home/mjw# bpftool map list
@@ -599,11 +639,6 @@ func main() {
 			//TODO: 删除旧的tc filter 和qdisc，重新创建新的tc filter 和qdisc，重新挂载bpf程序。
 			return
 		}
-		if newCfg.Debug != cfg.Debug {
-			http.Error(w, "reload失败: debug 不支持动态变更，请重启程序后生效", http.StatusBadRequest)
-			return
-		}
-
 		newDomainBitmasks, newEntries, err := rebuildRules(newCfg, &objs)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
@@ -612,6 +647,12 @@ func main() {
 		checkDomainSuffixRules(newCfg, &objs)
 		if newCfg.DomainMatchMode != cfg.DomainMatchMode {
 			if err := setLoadedDomainMatchMode(&objs, newCfg.DomainMatchMode); err != nil {
+				http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
+				return
+			}
+		}
+		if newCfg.Debug != cfg.Debug {
+			if err := setLoadedDebugMode(&objs, newCfg.Debug); err != nil {
 				http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusInternalServerError)
 				return
 			}
@@ -631,12 +672,51 @@ func main() {
 			"cidrs":             len(entries),
 		})
 	})
+	mux.HandleFunc("/debug", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			reloadMu.Lock()
+			debug := cfg.Debug
+			reloadMu.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":    true,
+				"debug": debug,
+			})
+		case http.MethodPost:
+			enabled, err := parseDebugEnabled(r)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("debug设置失败: %v", err), http.StatusBadRequest)
+				return
+			}
+
+			reloadMu.Lock()
+			defer reloadMu.Unlock()
+
+			if err := setLoadedDebugMode(&objs, enabled); err != nil {
+				http.Error(w, fmt.Sprintf("debug设置失败: %v", err), http.StatusInternalServerError)
+				return
+			}
+			cfg.Debug = enabled
+			log.Printf("debug日志已设置为: %v", cfg.Debug)
+
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok":    true,
+				"debug": cfg.Debug,
+			})
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 	server = &http.Server{
 		Addr:    reloadAddr,
 		Handler: mux,
 	}
 	go func() {
 		log.Printf("reload接口已启动: curl -X POST http://%s/reload", reloadAddr)
+		log.Printf("debug接口: curl http://%s/debug 或 curl -X POST 'http://%s/debug?debug=true'", reloadAddr, reloadAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("reload HTTP 服务异常退出: %v", err)
 		}

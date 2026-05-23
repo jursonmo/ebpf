@@ -11,11 +11,25 @@ enum domain_match_mode {
 };
 
 volatile const __u32 domain_match_mode = DOMAIN_MATCH_EXACT;
-volatile const __u32 debug_enabled = 0;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} debug_config SEC(".maps");
+
+static __always_inline int debug_is_enabled(void)
+{
+    __u32 key = 0;
+    __u32 *enabled = bpf_map_lookup_elem(&debug_config, &key);
+
+    return enabled && *enabled;
+}
 
 #define debug_bpf_printk(...)        \
     do {                             \
-        if (debug_enabled)           \
+        if (debug_is_enabled())      \
             bpf_printk(__VA_ARGS__); \
     } while (0)
 
