@@ -1,5 +1,5 @@
 {
-  "interface": "ens2",
+  "interfaces": ["ens2", "eth0"],
   "debug": false,
   "rules": [
     {

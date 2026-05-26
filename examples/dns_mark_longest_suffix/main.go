@@ -54,7 +54,7 @@ const (
 )
 
 type Config struct {
-	Interface       string          `json:"interface"`
+	Interfaces      []string        `json:"interfaces"`
 	DomainMatchMode DomainMatchMode `json:"domain_match_mode"`
 	Debug           bool            `json:"debug"`
 	Rules           []Rule          `json:"rules"`
@@ -87,6 +87,15 @@ type cidrEntry struct {
 	bitmask uint64
 }
 
+type tcAttachment struct {
+	iface       string
+	lnk         netlink.Link
+	filter      *netlink.BpfFilter
+	qdisc       *netlink.GenericQdisc
+	filterAdded bool
+	qdiscAdded  bool
+}
+
 const reloadAddr = "127.0.0.1:18080"
 const tcFilterName = "dns_mark"
 const tcFilterHandle uint32 = 1
@@ -117,6 +126,152 @@ func deleteIngressBpfFilters(link netlink.Link, wantName string, wantHandle uint
 	return deleted, nil
 }
 
+func normalizeInterfaces(interfaceNames []string) ([]string, error) {
+	seen := make(map[string]struct{})
+	normalized := make([]string, 0, len(interfaceNames))
+	add := func(name string) error {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil
+		}
+		if _, ok := seen[name]; ok {
+			return nil
+		}
+		if strings.ContainsAny(name, "/\x00") {
+			return fmt.Errorf("网卡名非法: %q", name)
+		}
+		seen[name] = struct{}{}
+		normalized = append(normalized, name)
+		return nil
+	}
+
+	for _, name := range interfaceNames {
+		if err := add(name); err != nil {
+			return nil, err
+		}
+	}
+	if len(normalized) == 0 {
+		return nil, errors.New("至少需要配置一个 interfaces")
+	}
+	return normalized, nil
+}
+
+func sameInterfaces(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, name := range a {
+		seen[name] = struct{}{}
+	}
+	for _, name := range b {
+		if _, ok := seen[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func attachTCIngress(iface string, progFD int) (*tcAttachment, error) {
+	lnk, err := netlink.LinkByName(iface)
+	if err != nil {
+		return nil, fmt.Errorf("找不到网卡 %s: %w", iface, err)
+	}
+
+	if n, delErr := deleteIngressBpfFilters(lnk, tcFilterName, tcFilterHandle); delErr != nil {
+		log.Printf("启动预清理 %s ingress filter 失败(忽略继续): %v", iface, delErr)
+	} else if n > 0 {
+		log.Printf("启动预清理 %s: 删除历史 ingress filter %d 条", iface, n)
+	}
+
+	attachment := &tcAttachment{iface: iface, lnk: lnk}
+	attachment.qdisc = &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: lnk.Attrs().Index,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+
+	if err := netlink.QdiscAdd(attachment.qdisc); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			return nil, fmt.Errorf("创建 %s clsact qdisc 失败: %w", iface, err)
+		}
+	} else {
+		attachment.qdiscAdded = true
+	}
+
+	attachment.filter = &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: lnk.Attrs().Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    tcFilterHandle,
+			Protocol:  unix.ETH_P_ALL,
+		},
+		Fd:           progFD,
+		Name:         tcFilterName,
+		DirectAction: true,
+	}
+	if err := netlink.FilterAdd(attachment.filter); err != nil {
+		if errors.Is(err, unix.EEXIST) || strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			n, delErr := deleteIngressBpfFilters(lnk, attachment.filter.Name, attachment.filter.Attrs().Handle)
+			if delErr != nil {
+				detachTCIngress(attachment)
+				return nil, fmt.Errorf("挂载 %s TC filter 失败(已存在，且删除旧filter失败): %w", iface, delErr)
+			}
+			if n == 0 {
+				detachTCIngress(attachment)
+				return nil, fmt.Errorf("挂载 %s TC filter 失败: 已存在且未找到可删除的历史 filter", iface)
+			}
+			if err = netlink.FilterAdd(attachment.filter); err != nil {
+				detachTCIngress(attachment)
+				return nil, fmt.Errorf("挂载 %s TC filter 失败(重试后): %w", iface, err)
+			}
+			log.Printf("挂载 %s 前发现同名旧 filter，已删除并重试成功", iface)
+		} else {
+			detachTCIngress(attachment)
+			return nil, fmt.Errorf("挂载 %s TC filter 失败: %w", iface, err)
+		}
+	}
+	attachment.filterAdded = true
+	return attachment, nil
+}
+
+func detachTCIngress(attachment *tcAttachment) {
+	if attachment == nil {
+		return
+	}
+	if attachment.filterAdded && attachment.filter != nil {
+		if err := netlink.FilterDel(attachment.filter); err != nil {
+			// 莫：每次都失败，打印删除 TC filter 失败: no such file or directory, 所以增加下面这个兜底删除操作。
+			// Some kernels/drivers don't find the object with the original
+			// create attrs on delete; fall back to listing ingress filters.
+			if errors.Is(err, unix.ENOENT) && attachment.lnk != nil {
+				n, listErr := deleteIngressBpfFilters(attachment.lnk, attachment.filter.Name, attachment.filter.Attrs().Handle)
+				if listErr != nil {
+					log.Printf("删除 %s TC filter 失败(兜底删除也失败): %v (fallback: %v)", attachment.iface, err, listErr)
+				} else if n > 0 {
+					log.Printf("删除 %s TC filter 成功(通过兜底扫描删除 %d 条)\n", attachment.iface, n)
+				} else {
+					log.Printf("删除 %s TC filter: 未找到匹配项，可能已被提前删除", attachment.iface)
+				}
+			} else {
+				log.Printf("删除 %s TC filter 失败: %v", attachment.iface, err)
+			}
+		} else {
+			log.Printf("删除 %s TC filter 成功\n", attachment.iface)
+		}
+	}
+	if attachment.qdiscAdded && attachment.qdisc != nil {
+		if err := netlink.QdiscDel(attachment.qdisc); err != nil {
+			log.Printf("删除 %s clsact qdisc 失败: %v", attachment.iface, err)
+		} else {
+			log.Printf("删除 %s clsact qdisc 成功\n", attachment.iface)
+		}
+	}
+}
+
 func loadConfig(cfgPath string) (Config, error) {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -126,6 +281,10 @@ func loadConfig(cfgPath string) (Config, error) {
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+	cfg.Interfaces, err = normalizeInterfaces(cfg.Interfaces)
+	if err != nil {
+		return Config{}, err
 	}
 	if len(cfg.Rules) == 0 {
 		return Config{}, errors.New("至少需要一条规则")
@@ -487,12 +646,8 @@ func main() {
 
 	*/
 	var (
-		filter      *netlink.BpfFilter
-		qdisc       *netlink.GenericQdisc
-		lnk         netlink.Link
+		attachments []*tcAttachment
 		server      *http.Server
-		filterAdded bool
-		qdiscAdded  bool
 		reloadMu    sync.Mutex
 		cleanupOnce sync.Once
 	)
@@ -508,33 +663,8 @@ func main() {
 				}
 				cancel()
 			}
-			if filterAdded && filter != nil {
-				if err := netlink.FilterDel(filter); err != nil {
-					//莫：每次都失败，打印删除 TC filter 失败: no such file or directory, 所以增加下面这个兜底删除操作。
-					// Some kernels/drivers don't find the object with the original
-					// create attrs on delete; fall back to listing ingress filters.
-					if errors.Is(err, unix.ENOENT) && lnk != nil {
-						n, listErr := deleteIngressBpfFilters(lnk, filter.Name, filter.Attrs().Handle)
-						if listErr != nil {
-							log.Printf("删除 TC filter 失败(兜底删除也失败): %v (fallback: %v)", err, listErr)
-						} else if n > 0 {
-							log.Printf("删除 TC filter 成功(通过兜底扫描删除 %d 条)\n", n)
-						} else {
-							log.Printf("删除 TC filter: 未找到匹配项，可能已被提前删除")
-						}
-					} else {
-						log.Printf("删除 TC filter 失败: %v", err)
-					}
-				} else {
-					log.Printf("删除 TC filter 成功\n")
-				}
-			}
-			if qdiscAdded && qdisc != nil {
-				if err := netlink.QdiscDel(qdisc); err != nil {
-					log.Printf("删除 clsact qdisc 失败: %v", err)
-				} else {
-					log.Printf("删除 clsact qdisc 成功\n")
-				}
+			for i := len(attachments) - 1; i >= 0; i-- {
+				detachTCIngress(attachments[i])
 			}
 			if err := objs.Close(); err != nil {
 				log.Printf("关闭 BPF 对象失败: %v", err)
@@ -553,68 +683,17 @@ func main() {
 	checkDomainSuffixRules(cfg, &objs)
 
 	// 4. 挂载到 TC ingress
-	lnk, err = netlink.LinkByName(cfg.Interface)
-	if err != nil {
-		log.Fatalf("找不到网卡 %s: %v", cfg.Interface, err)
-	}
-
-	if n, delErr := deleteIngressBpfFilters(lnk, tcFilterName, tcFilterHandle); delErr != nil {
-		log.Printf("启动预清理 ingress filter 失败(忽略继续): %v", delErr)
-	} else if n > 0 {
-		log.Printf("启动预清理: 删除历史 ingress filter %d 条", n)
-	}
-
-	qdisc = &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: lnk.Attrs().Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
-	}
-
-	if err := netlink.QdiscAdd(qdisc); err != nil {
-		// 兼容接口上已存在 clsact 的场景
-		if !strings.Contains(strings.ToLower(err.Error()), "file exists") {
-			log.Fatalf("创建 clsact qdisc 失败: %v", err)
+	for _, iface := range cfg.Interfaces {
+		attachment, err := attachTCIngress(iface, objs.DnsMark.FD())
+		if err != nil {
+			cleanup("挂载失败")
+			log.Fatal(err)
 		}
-		//log.Fatalf("创建 clsact qdisc 失败: %v", err)
-	} else {
-		qdiscAdded = true
+		attachments = append(attachments, attachment)
 	}
-
-	filter = &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: lnk.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    tcFilterHandle,
-			Protocol:  unix.ETH_P_ALL,
-		},
-		Fd:           objs.DnsMark.FD(),
-		Name:         tcFilterName,
-		DirectAction: true,
-	}
-	if err := netlink.FilterAdd(filter); err != nil {
-		if errors.Is(err, unix.EEXIST) || strings.Contains(strings.ToLower(err.Error()), "file exists") {
-			n, delErr := deleteIngressBpfFilters(lnk, filter.Name, filter.Attrs().Handle)
-			if delErr != nil {
-				log.Fatalf("挂载 TC filter 失败(已存在，且删除旧filter失败): %v", delErr)
-			}
-			if n == 0 {
-				log.Fatalf("挂载 TC filter 失败: 已存在且未找到可删除的历史 filter")
-			}
-			if err = netlink.FilterAdd(filter); err != nil {
-				log.Fatalf("挂载 TC filter 失败(重试后): %v", err)
-			}
-			log.Printf("挂载前发现同名旧 filter，已删除并重试成功")
-		} else {
-			log.Fatalf("挂载 TC filter 失败: %v", err)
-		}
-	}
-	filterAdded = true
 
 	// 5. 启动 reload HTTP 接口
-	currentIface := cfg.Interface
+	currentInterfaces := append([]string(nil), cfg.Interfaces...)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -630,10 +709,10 @@ func main() {
 			http.Error(w, fmt.Sprintf("reload失败: %v", err), http.StatusBadRequest)
 			return
 		}
-		if newCfg.Interface != currentIface {
+		if !sameInterfaces(newCfg.Interfaces, currentInterfaces) {
 			http.Error(
 				w,
-				fmt.Sprintf("reload失败: interface 不允许动态变更，当前=%s 新配置=%s", currentIface, newCfg.Interface),
+				fmt.Sprintf("reload失败: interfaces 不允许动态变更，当前=%v 新配置=%v", currentInterfaces, newCfg.Interfaces),
 				http.StatusBadRequest,
 			)
 			//TODO: 删除旧的tc filter 和qdisc，重新创建新的tc filter 和qdisc，重新挂载bpf程序。
@@ -665,6 +744,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":                true,
+			"interfaces":        cfg.Interfaces,
 			"domain_match_mode": cfg.DomainMatchMode,
 			"debug":             cfg.Debug,
 			"rules":             len(cfg.Rules),
@@ -760,7 +840,7 @@ func main() {
 		root@ubuntu2204:/home/mjw/ebpf/examples/dns_mark#
 	*/
 	// 6. 打印摘要
-	fmt.Printf("dns_mark 已挂载到 %s (ingress)\n", cfg.Interface)
+	fmt.Printf("dns_mark 已挂载到 %s (ingress)\n", strings.Join(cfg.Interfaces, ", "))
 	fmt.Printf("域名匹配模式: %s\n", cfg.DomainMatchMode)
 	fmt.Printf("debug日志: %v\n", cfg.Debug)
 	fmt.Printf("共 %d 条规则, %d 个域名, %d 个 CIDR\n",
@@ -774,13 +854,6 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
 	fmt.Println("收到信号:", s)
-	err = objs.Close() //关闭bpf对象，但是不会删除 prog map. 还是要调用cleanup函数来删除。
-	if err != nil {
-		log.Printf("关闭 BPF 对象失败: %v\n", err)
-	} else {
-		fmt.Println("关闭 BPF 对象成功")
-	}
-
 	cleanup(fmt.Sprintf("收到信号 %s", s))
 	os.Exit(0)
 }
